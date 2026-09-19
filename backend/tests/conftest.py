@@ -84,6 +84,12 @@ def clean_state(integration_environment):
     integration_environment["redis"].delete(integration_environment["queue_name"])
     settings.mock_provider_delay_seconds = 0.05
     settings.mock_provider_failure_mode = "none"
+    settings.video_provider = "mock"
+    settings.runwayml_api_secret = None
+    settings.runway_soft_limit_usd = 10
+    settings.runway_hard_limit_usd = 30
+    settings.runway_poll_interval_seconds = 0.01
+    settings.runway_task_timeout_seconds = 2
     settings.max_retries = 2
 
 
