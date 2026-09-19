@@ -1,4 +1,5 @@
 from pathlib import Path
+from shutil import copyfileobj
 from typing import BinaryIO
 
 
@@ -27,7 +28,14 @@ class LocalStorage:
     def save_file(self, key: str, source_path: Path) -> str:
         path = self._safe(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(source_path.read_bytes())
+        temporary = path.with_suffix(path.suffix + ".partial")
+        try:
+            with source_path.open("rb") as source, temporary.open("wb") as output:
+                copyfileobj(source, output, 1024 * 1024)
+            temporary.replace(path)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
         return key
 
     def path(self, key: str) -> Path:

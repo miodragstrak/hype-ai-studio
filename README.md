@@ -1,6 +1,6 @@
 # Hype AI Studio
 
-This spike proves a local asynchronous path for a music-video project: planned shots are submitted to a Redis-backed worker, a deterministic mock provider creates MP4 variants, and the same shared backend package owns API and worker code. No real AI provider is integrated.
+This spike proves a local asynchronous path for a music-video project: planned shots are submitted to a Redis-backed worker, a video provider creates MP4 variants, and the same shared backend package owns API and worker code. The deterministic mock provider remains the default; Runway Dev is available as an opt-in provider.
 
 ## Architecture
 
@@ -56,6 +56,44 @@ cd frontend && npm run dev
 
 Frontend checks are `npm run lint`, `npm test`, and `npm run build`.
 
+## Runway Dev
+
+The worker integrates with Runway through the official Python SDK and the existing provider-neutral
+contract. It is not live-verified yet. The mock remains the default; Runway is an explicit opt-in.
+Create a local `.env` that is never committed and keep the organization key server-side:
+
+```bash
+export VIDEO_PROVIDER=runway
+export RUNWAYML_API_SECRET=key_...
+export RUNWAY_VIDEO_MODEL=gen4.5
+export RUNWAY_VIDEO_DURATION_SECONDS=5
+export RUNWAY_VIDEO_RATIO=1280:720
+python -m backend.app.worker
+```
+
+The fixed spike request is Gen-4.5 text-to-video, five seconds, at `1280:720`. At the configured
+12 credits per second and `$0.01` per credit, its estimate is 60 credits or `$0.60`. This estimate
+is persisted with the attempt; no actual cost is invented when Runway does not return authoritative
+task cost. These are temporary development-wide controls, not customer billing: crossing the `$10`
+soft limit records a warning, while a projected total above the `$30` hard limit is rejected before
+submission. Autobilling is not assumed or enabled.
+
+The worker submits once, persists the task ID, polls without the SDK's blocking wait helper, and
+copies successful output into local storage before the temporary URL expires. A submission exception
+is treated as ambiguous and non-retryable because Runway may already have accepted a paid task;
+manual reconciliation is required. The secret is redacted from persisted and returned errors.
+
+After setting the secret and confirming account credits, the future controlled smoke test is:
+
+```bash
+VIDEO_PROVIDER=runway .venv/bin/python -m backend.app.worker
+```
+
+Start the API separately, create one five-second shot, and submit exactly one generation. Do not
+commit `.env`. A successful real Runway integration must not be claimed until that paid path passes.
+
 ## Limitations
 
-There is no authentication, production UI, Tour Guide workflow, real provider, cloud storage, hosted Supabase, deployment, cost controls, or production monitoring. Only the deterministic mock provider and local filesystem adapter exist.
+There is no authentication, production UI, Tour Guide workflow, cloud storage, hosted Supabase,
+deployment, cost controls, or production monitoring. Runway usage requires an external account,
+credits, and a server-side API key.
