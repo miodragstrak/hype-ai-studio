@@ -1,4 +1,4 @@
-# Hype AI Studio: HYPE-STUDIO-001A
+# Hype AI Studio
 
 This spike proves a local asynchronous path for a music-video project: planned shots are submitted to a Redis-backed worker, a deterministic mock provider creates MP4 variants, and the same shared backend package owns API and worker code. No real AI provider is integrated.
 
@@ -38,6 +38,23 @@ Each run creates and drops uniquely named PostgreSQL databases, uses a unique Re
 removes generated files from the ignored `test-artifacts/` directory.
 
 The API is available at `http://localhost:8000`; the frontend is normally `http://localhost:5173`. Upload test audio through `POST /projects/{project_id}/assets`. Use Docker Compose for full local dependencies with `docker compose up -d`.
+
+## Producer review UI
+
+The 001C React interface provides project setup, asset upload, shot planning and ordering,
+asynchronous generation monitoring, variant selection/rejection, render readiness, and final MP4
+preview/download. Its routes are `/projects`, `/projects/new`, and the Setup, Assets, Shots, Review,
+and Render stages under `/projects/:projectId`.
+
+Set `VITE_API_BASE_URL` when the API is not running on `http://localhost:8000`. For local work:
+
+```bash
+uvicorn backend.app.api:app --reload
+python -m backend.app.worker
+cd frontend && npm run dev
+```
+
+Frontend checks are `npm run lint`, `npm test`, and `npm run build`.
 
 ## Limitations
 

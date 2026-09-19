@@ -71,7 +71,7 @@ def test_project_upload_shot_job_lookup_events_and_validation(client, db, integr
     event_types = [
         event["event_type"] for event in client.get(f"/projects/{project_id}/events").json()
     ]
-    assert event_types == ["PROJECT_CREATED", "JOB_SUBMITTED"]
+    assert event_types == ["PROJECT_CREATED", "ASSET_UPLOADED", "JOB_SUBMITTED"]
 
     missing_id = uuid4()
     assert client.get(f"/projects/{missing_id}").status_code == 404
