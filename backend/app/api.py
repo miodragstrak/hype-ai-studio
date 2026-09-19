@@ -3,7 +3,9 @@ import json
 from pathlib import PurePath
 from uuid import UUID
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
@@ -14,6 +16,12 @@ from backend.app.queue import enqueue
 from backend.app.storage.local import LocalStorage
 
 app = FastAPI(title="Hype AI Studio")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in settings.cors_origins.split(",")],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class ProjectCreate(BaseModel):
@@ -30,6 +38,14 @@ class ShotCreate(BaseModel):
     intended_duration: float = Field(gt=0, le=60)
 
 
+class ShotUpdate(ShotCreate):
+    pass
+
+
+class ShotOrder(BaseModel):
+    shot_ids: list[UUID] = Field(min_length=1)
+
+
 class RenderCreate(BaseModel):
     variant_ids: list[UUID] = Field(min_length=1)
     audio_asset_id: UUID
@@ -40,6 +56,40 @@ def record_event(cursor, project_id, event_type, entity_type, entity_id, payload
         "INSERT INTO events(project_id,event_type,actor_type,entity_type,entity_id,payload) VALUES (%s,%s,'api',%s,%s,%s)",
         (project_id, event_type, entity_type, entity_id, Jsonb(payload or {})),
     )
+
+
+def media_response(storage_key: str, mime_type: str, download: bool) -> FileResponse:
+    path = LocalStorage(settings.storage_root).path(storage_key)
+    if not path.is_file():
+        raise HTTPException(404, "media not found")
+    disposition = "attachment" if download else "inline"
+    return FileResponse(
+        path,
+        media_type=mime_type,
+        filename=path.name,
+        content_disposition_type=disposition,
+    )
+
+
+@app.get("/projects")
+def list_projects():
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT id,project_type,title,creative_brief,aspect_ratio,status,created_at,updated_at "
+            "FROM projects WHERE project_type='MUSIC_VIDEO' ORDER BY updated_at DESC,created_at DESC"
+        )
+        rows = cursor.fetchall()
+    fields = (
+        "id",
+        "project_type",
+        "title",
+        "creative_brief",
+        "aspect_ratio",
+        "status",
+        "created_at",
+        "updated_at",
+    )
+    return [dict(zip(fields, row)) for row in rows]
 
 
 @app.post("/projects", status_code=201)
@@ -63,9 +113,18 @@ def get_project(project_id: UUID):
             (project_id,),
         )
         row = cursor.fetchone()
+        if row:
+            cursor.execute(
+                "SELECT (SELECT count(*) FROM assets WHERE project_id=%s),"
+                "(SELECT count(*) FROM shots WHERE project_id=%s),"
+                "(SELECT count(*) FROM shots WHERE project_id=%s AND selected_variant_id IS NOT NULL),"
+                "(SELECT count(*) FROM renders WHERE project_id=%s)",
+                (project_id, project_id, project_id, project_id),
+            )
+            counts = cursor.fetchone()
     if not row:
         raise HTTPException(404, "project not found")
-    return dict(
+    result = dict(
         zip(
             (
                 "id",
@@ -80,6 +139,13 @@ def get_project(project_id: UUID):
             row,
         )
     )
+    result["summary"] = {
+        "assets": counts[0],
+        "shots": counts[1],
+        "selected_variants": counts[2],
+        "renders": counts[3],
+    }
+    return result
 
 
 @app.post("/projects/{project_id}/assets", status_code=201)
@@ -121,8 +187,53 @@ def upload_asset(
             ),
         )
         asset_id = cursor.fetchone()[0]
+        record_event(
+            cursor,
+            project_id,
+            "ASSET_UPLOADED",
+            "asset",
+            asset_id,
+            {"asset_type": asset_type, "filename": filename},
+        )
         conn.commit()
     return {"id": str(asset_id), "storage_key": key, "checksum": checksum}
+
+
+@app.get("/projects/{project_id}/assets")
+def list_assets(project_id: UUID):
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT 1 FROM projects WHERE id=%s", (project_id,))
+        if cursor.fetchone() is None:
+            raise HTTPException(404, "project not found")
+        cursor.execute(
+            "SELECT id,asset_type,storage_key,mime_type,size_bytes,checksum,rights_metadata,created_at "
+            "FROM assets WHERE project_id=%s ORDER BY created_at",
+            (project_id,),
+        )
+        rows = cursor.fetchall()
+    return [
+        {
+            "id": str(row[0]),
+            "asset_type": row[1],
+            "filename": PurePath(row[2]).name,
+            "mime_type": row[3],
+            "size_bytes": row[4],
+            "checksum": row[5],
+            "rights_metadata": row[6],
+            "created_at": row[7],
+        }
+        for row in rows
+    ]
+
+
+@app.get("/assets/{asset_id}/media")
+def get_asset_media(asset_id: UUID, download: bool = Query(False)):
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT storage_key,mime_type FROM assets WHERE id=%s", (asset_id,))
+        row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(404, "asset not found")
+    return media_response(row[0], row[1], download)
 
 
 @app.post("/projects/{project_id}/shots", status_code=201)
@@ -144,7 +255,10 @@ def create_shot(project_id: UUID, body: ShotCreate):
 def list_shots(project_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
-            "SELECT id,ordinal,title,prompt,intended_duration,status,selected_variant_id FROM shots WHERE project_id=%s ORDER BY ordinal",
+            "SELECT s.id,s.ordinal,s.title,s.prompt,s.intended_duration,s.status,s.selected_variant_id,"
+            "j.id,j.status FROM shots s LEFT JOIN LATERAL "
+            "(SELECT id,status FROM jobs WHERE shot_id=s.id ORDER BY created_at DESC LIMIT 1) j ON true "
+            "WHERE s.project_id=%s ORDER BY s.ordinal",
             (project_id,),
         )
         rows = cursor.fetchall()
@@ -157,9 +271,43 @@ def list_shots(project_id: UUID):
             "intended_duration": float(row[4]),
             "status": row[5],
             "selected_variant_id": str(row[6]) if row[6] else None,
+            "latest_job_id": str(row[7]) if row[7] else None,
+            "latest_job_status": row[8],
         }
         for row in rows
     ]
+
+
+@app.put("/shots/{shot_id}")
+def update_shot(shot_id: UUID, body: ShotUpdate):
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "UPDATE shots SET ordinal=%s,title=%s,prompt=%s,intended_duration=%s,updated_at=now() "
+            "WHERE id=%s RETURNING id",
+            (body.ordinal, body.title, body.prompt, body.intended_duration, shot_id),
+        )
+        if cursor.fetchone() is None:
+            raise HTTPException(404, "shot not found")
+        conn.commit()
+    return {"id": str(shot_id), **body.model_dump()}
+
+
+@app.put("/projects/{project_id}/shots/order")
+def reorder_shots(project_id: UUID, body: ShotOrder):
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT id FROM shots WHERE project_id=%s ORDER BY ordinal FOR UPDATE", (project_id,)
+        )
+        existing = [row[0] for row in cursor.fetchall()]
+        if set(existing) != set(body.shot_ids) or len(existing) != len(body.shot_ids):
+            raise HTTPException(422, "shot_ids must contain every project shot exactly once")
+        cursor.execute("UPDATE shots SET ordinal=-ordinal WHERE project_id=%s", (project_id,))
+        for ordinal, shot_id in enumerate(body.shot_ids, start=1):
+            cursor.execute(
+                "UPDATE shots SET ordinal=%s,updated_at=now() WHERE id=%s", (ordinal, shot_id)
+            )
+        conn.commit()
+    return {"shot_ids": [str(value) for value in body.shot_ids]}
 
 
 @app.post("/shots/{shot_id}/generations", status_code=202)
@@ -222,7 +370,9 @@ def get_job(job_id: UUID):
 def variants(shot_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
-            "SELECT id,storage_key,mime_type,duration,review_status,created_at FROM shot_variants WHERE shot_id=%s ORDER BY created_at",
+            "SELECT v.id,v.storage_key,v.mime_type,v.duration,v.review_status,v.created_at,v.generation_attempt_id,"
+            "a.attempt_number,a.job_id FROM shot_variants v JOIN generation_attempts a ON a.id=v.generation_attempt_id "
+            "WHERE v.shot_id=%s ORDER BY v.created_at",
             (shot_id,),
         )
         rows = cursor.fetchall()
@@ -234,6 +384,9 @@ def variants(shot_id: UUID):
             "duration": float(r[3]),
             "review_status": r[4],
             "created_at": r[5],
+            "generation_attempt_id": str(r[6]),
+            "attempt_number": r[7],
+            "job_id": str(r[8]),
         }
         for r in rows
     ]
@@ -260,6 +413,40 @@ def select_variant(shot_id: UUID, variant_id: UUID):
         record_event(cursor, project[0], "VARIANT_SELECTED", "shot_variant", variant_id)
         conn.commit()
     return {"variant_id": str(variant_id), "review_status": "SELECTED"}
+
+
+@app.post("/shots/{shot_id}/variants/{variant_id}/reject")
+def reject_variant(shot_id: UUID, variant_id: UUID):
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT s.project_id,v.review_status FROM shots s JOIN shot_variants v ON v.shot_id=s.id "
+            "WHERE s.id=%s AND v.id=%s FOR UPDATE",
+            (shot_id, variant_id),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(404, "variant not found")
+        cursor.execute(
+            "UPDATE shot_variants SET review_status='REJECTED' WHERE id=%s", (variant_id,)
+        )
+        cursor.execute(
+            "UPDATE shots SET selected_variant_id=NULL WHERE id=%s AND selected_variant_id=%s",
+            (shot_id, variant_id),
+        )
+        if row[1] != "REJECTED":
+            record_event(cursor, row[0], "VARIANT_REJECTED", "shot_variant", variant_id)
+        conn.commit()
+    return {"variant_id": str(variant_id), "review_status": "REJECTED"}
+
+
+@app.get("/variants/{variant_id}/media")
+def get_variant_media(variant_id: UUID, download: bool = Query(False)):
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT storage_key,mime_type FROM shot_variants WHERE id=%s", (variant_id,))
+        row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(404, "variant not found")
+    return media_response(row[0], row[1], download)
 
 
 @app.get("/projects/{project_id}/events")
@@ -317,6 +504,29 @@ def create_render(project_id: UUID, body: RenderCreate):
     return {"id": str(render_id), "status": "QUEUED"}
 
 
+@app.get("/projects/{project_id}/renders")
+def list_renders(project_id: UUID):
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT id,status,output_storage_key,mime_type,duration,error_data,created_at,started_at,completed_at "
+            "FROM renders WHERE project_id=%s ORDER BY created_at DESC",
+            (project_id,),
+        )
+        rows = cursor.fetchall()
+    fields = (
+        "id",
+        "status",
+        "output_storage_key",
+        "mime_type",
+        "duration",
+        "error_data",
+        "created_at",
+        "started_at",
+        "completed_at",
+    )
+    return [dict(zip(fields, row)) for row in rows]
+
+
 @app.get("/renders/{render_id}")
 def get_render(render_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
@@ -343,3 +553,17 @@ def get_render(render_id: UUID):
             row,
         )
     )
+
+
+@app.get("/renders/{render_id}/media")
+def get_render_media(render_id: UUID, download: bool = Query(False)):
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT output_storage_key,mime_type,status FROM renders WHERE id=%s", (render_id,)
+        )
+        row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(404, "render not found")
+    if row[2] != "SUCCEEDED" or not row[0]:
+        raise HTTPException(409, "render output is not available")
+    return media_response(row[0], row[1] or "video/mp4", download)

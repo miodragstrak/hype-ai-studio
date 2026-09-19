@@ -165,6 +165,14 @@ def test_variant_selection_and_async_render_through_worker(
     assert render["status"] == "SUCCEEDED", render["error_data"]
     output = Path(integration_environment["storage_root"]) / render["output_storage_key"]
     assert output.exists()
+    listed_renders = client.get(f"/projects/{project_id}/renders")
+    assert listed_renders.status_code == 200
+    assert listed_renders.json()[0]["id"] == render_id
+    preview = client.get(f"/renders/{render_id}/media")
+    assert preview.status_code == 200
+    assert preview.headers["content-type"] == "video/mp4"
+    download = client.get(f"/renders/{render_id}/media", params={"download": "true"})
+    assert "attachment" in download.headers["content-disposition"]
     probe = subprocess.run(
         [
             settings.ffprobe_executable,

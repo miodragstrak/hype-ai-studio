@@ -1,0 +1,9 @@
+export type JobStatus = "QUEUED" | "SUBMITTING" | "PROVIDER_PENDING" | "PROCESSING" | "DOWNLOADING" | "RETRY_SCHEDULED" | "SUCCEEDED" | "FAILED" | "CANCEL_REQUESTED" | "CANCELLED" | "TIMED_OUT";
+export type Project = { id: string; project_type: "MUSIC_VIDEO"; title: string; creative_brief: string; aspect_ratio: string; status: string; created_at: string; updated_at: string; summary?: { assets: number; shots: number; selected_variants: number; renders: number } };
+export type Asset = { id: string; asset_type: string; filename: string; mime_type: string; size_bytes: number; checksum: string; rights_metadata: Record<string, unknown>; created_at: string };
+export type Shot = { id: string; ordinal: number; title: string; prompt: string; intended_duration: number; status: string; selected_variant_id: string | null; latest_job_id?: string | null; latest_job_status?: JobStatus | null };
+export type VariantStatus = "UNREVIEWED" | "SELECTED" | "REJECTED" | "SUPERSEDED";
+export type Variant = { id: string; mime_type: string; duration: number; review_status: VariantStatus; created_at: string; generation_attempt_id: string; attempt_number: number; job_id: string };
+export type Job = { id: string; status: JobStatus; retry_count: number; error_data: { message?: string; type?: string } | null; created_at: string; started_at: string | null; completed_at: string | null };
+export type Render = { id: string; status: string; output_storage_key: string | null; mime_type: string | null; duration: number | null; error_data: { message?: string } | null; created_at: string; started_at: string | null; completed_at: string | null };
+export type ActivityEvent = { event_type: string; entity_type: string; entity_id: string; payload: Record<string, unknown>; created_at: string };

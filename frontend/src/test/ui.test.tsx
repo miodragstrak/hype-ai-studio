@@ -1,0 +1,39 @@
+import { act, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { MemoryRouter } from "react-router-dom";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { api } from "../api/client";
+import { ErrorState, LoadingState } from "../components/States";
+import { StatusBadge } from "../components/StatusBadge";
+import { useJobPolling } from "../hooks/usePolling";
+import { App } from "../routes/App";
+import { CompletedRender, NewProjectPage, readiness } from "../routes/pages";
+import type { Asset, Job, Project, Shot, Variant } from "../types";
+
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
+const project: Project = { id: "p1", project_type: "MUSIC_VIDEO", title: "Campaign", creative_brief: "A complete creative brief", aspect_ratio: "16:9", status: "DRAFT", created_at: "2026-01-01", updated_at: "2026-01-01", summary: { assets: 0, shots: 1, selected_variants: 0, renders: 0 } };
+const shot: Shot = { id: "s1", ordinal: 1, title: "Opening", prompt: "Stage performance", intended_duration: 3, status: "PLANNED", selected_variant_id: null };
+const variants: Variant[] = [
+  { id: "v1", mime_type: "video/mp4", duration: 3, review_status: "SELECTED", created_at: "2026-01-01", generation_attempt_id: "a1", attempt_number: 1, job_id: "j1" },
+  { id: "v2", mime_type: "video/mp4", duration: 3, review_status: "UNREVIEWED", created_at: "2026-01-02", generation_attempt_id: "a2", attempt_number: 1, job_id: "j2" },
+];
+
+function mockWorkspace() { vi.spyOn(api, "project").mockResolvedValue(project); vi.spyOn(api, "events").mockResolvedValue([]); }
+
+describe("producer UI", () => {
+  it("validates project creation", async () => { render(<MemoryRouter><NewProjectPage/></MemoryRouter>); const button = screen.getByRole("button", { name: "Create project" }); expect(button).toBeDisabled(); await userEvent.type(screen.getByLabelText("Project title"), "Campaign"); await userEvent.type(screen.getByLabelText("Creative brief"), "short"); expect(button).toBeDisabled(); await userEvent.type(screen.getByLabelText("Creative brief"), " but sufficient"); expect(button).toBeEnabled(); });
+  it("renders loading and API error states", async () => { const retry = vi.fn(); const view = render(<LoadingState label="Loading projects"/>); expect(screen.getByText("Loading projects")).toBeVisible(); view.rerender(<ErrorState message="API unavailable" retry={retry}/>); await userEvent.click(screen.getByTitle("Retry")); expect(retry).toHaveBeenCalledOnce(); });
+  it.each([["QUEUED", "Queued"], ["PROVIDER_PENDING", "Awaiting generation"], ["RETRY_SCHEDULED", "Retry scheduled"], ["FAILED", "Failed"]])("maps %s status", (status, label) => { render(<StatusBadge status={status}/>); expect(screen.getByText(label)).toBeVisible(); });
+  it("prevents duplicate generation submission", async () => { mockWorkspace(); vi.spyOn(api, "shots").mockResolvedValue([shot]); vi.spyOn(api, "generate").mockReturnValue(new Promise(() => {})); render(<MemoryRouter initialEntries={["/projects/p1/shots"]}><App/></MemoryRouter>); const button = await screen.findByRole("button", { name: "Generate variant" }); await userEvent.click(button); expect(button).toBeDisabled(); await userEvent.click(button); expect(api.generate).toHaveBeenCalledOnce(); });
+  it("renders variant states and keeps rejected variants visible", async () => { mockWorkspace(); vi.spyOn(api, "shots").mockResolvedValue([shot]); vi.spyOn(api, "variants").mockResolvedValue([{ ...variants[0], review_status: "SUPERSEDED" }, { ...variants[1], review_status: "REJECTED" }]); render(<MemoryRouter initialEntries={["/projects/p1/review"]}><App/></MemoryRouter>); expect(await screen.findByText("Superseded")).toBeVisible(); expect(screen.getByText("Rejected")).toBeVisible(); expect(screen.getAllByRole("article")).toHaveLength(2); });
+  it("visibly supersedes the old selection when another is selected", async () => { mockWorkspace(); vi.spyOn(api, "shots").mockResolvedValue([shot]); let current = variants; vi.spyOn(api, "variants").mockImplementation(async () => current); vi.spyOn(api, "selectVariant").mockImplementation(async () => { current = [{ ...variants[0], review_status: "SUPERSEDED" }, { ...variants[1], review_status: "SELECTED" }]; return {}; }); render(<MemoryRouter initialEntries={["/projects/p1/review"]}><App/></MemoryRouter>); const selectButtons = await screen.findAllByRole("button", { name: "Select" }); await userEvent.click(selectButtons[1]); await waitFor(() => expect(screen.getByText("Superseded")).toBeVisible()); expect(screen.getAllByText("Selected").length).toBeGreaterThan(0); });
+  it("computes render readiness and missing requirements", () => { expect(readiness([shot], [], []).checks.every(check => check.ok)).toBe(false); const audio: Asset = { id: "audio", asset_type: "AUDIO", filename: "song.wav", mime_type: "audio/wav", size_bytes: 1, checksum: "x", rights_metadata: {}, created_at: "x" }; expect(readiness([{ ...shot, selected_variant_id: "v1", latest_job_status: "SUCCEEDED" }], [audio], []).checks.every(check => check.ok)).toBe(true); });
+  it("disables render when requirements are missing", async () => { mockWorkspace(); vi.spyOn(api, "shots").mockResolvedValue([shot]); vi.spyOn(api, "assets").mockResolvedValue([]); vi.spyOn(api, "renders").mockResolvedValue([]); render(<MemoryRouter initialEntries={["/projects/p1/render"]}><App/></MemoryRouter>); expect(await screen.findByRole("button", { name: "Submit final render" })).toBeDisabled(); expect(screen.getByText("Resolve the missing requirements before rendering.")).toBeVisible(); });
+  it("shows completed preview and download", () => { render(<CompletedRender render={{ id: "r1", duration: 6.2 }}/>); expect(screen.getByText("Final video ready")).toBeVisible(); expect(screen.getByRole("link", { name: "Download MP4" })).toHaveAttribute("href", expect.stringContaining("download=true")); expect(document.querySelector("video")).toHaveAttribute("src", expect.stringContaining("/renders/r1/media")); });
+});
+
+function PollProbe() { const job = useJobPolling("j1", 100); return <span>{job?.status || "waiting"}</span>; }
+describe("polling", () => {
+  it("stops on terminal status", async () => { vi.useFakeTimers(); const complete: Job = { id: "j1", status: "SUCCEEDED", retry_count: 0, error_data: null, created_at: "", started_at: null, completed_at: "" }; vi.spyOn(api, "job").mockResolvedValue(complete); render(<PollProbe/>); await act(async () => { await Promise.resolve(); }); expect(screen.getByText("SUCCEEDED")).toBeVisible(); await act(async () => vi.advanceTimersByTime(500)); expect(api.job).toHaveBeenCalledOnce(); });
+  it("cleans its timer on unmount", async () => { vi.useFakeTimers(); vi.spyOn(api, "job").mockResolvedValue({ id: "j1", status: "PROCESSING", retry_count: 0, error_data: null, created_at: "", started_at: "", completed_at: null }); const view = render(<PollProbe/>); await act(async () => { await Promise.resolve(); }); const count = vi.mocked(api.job).mock.calls.length; view.unmount(); await act(async () => vi.advanceTimersByTime(500)); expect(api.job).toHaveBeenCalledTimes(count); });
+});
