@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 from datetime import datetime
 from pathlib import PurePath
@@ -8,6 +9,7 @@ from uuid import UUID
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from PIL import Image, UnidentifiedImageError
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field, ValidationError
 
@@ -217,9 +219,11 @@ def upload_asset(
     filename = file.filename or ""
     if not filename or PurePath(filename).name != filename:
         raise HTTPException(400, "unsafe or missing filename")
-    data = file.file.read()
+    data = file.file.read(settings.max_asset_upload_bytes + 1)
     if not data:
         raise HTTPException(400, "uploaded file is empty")
+    if len(data) > settings.max_asset_upload_bytes:
+        raise HTTPException(413, "uploaded file exceeds the size limit")
     try:
         rights = json.loads(rights_metadata)
     except json.JSONDecodeError as exc:
@@ -373,29 +377,101 @@ def reorder_shots(project_id: UUID, body: ShotOrder):
 
 
 @app.post("/shots/{shot_id}/generations", status_code=202)
-def submit_generation(shot_id: UUID, idempotency_key: str):
+def submit_generation(shot_id: UUID, idempotency_key: str, reference_asset_id: UUID | None = None):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute("SELECT id,project_id FROM shots WHERE id=%s", (shot_id,))
         shot = cursor.fetchone()
         if not shot:
             raise HTTPException(404, "shot not found")
+        request_data: dict[str, Any] = {}
+        if reference_asset_id:
+            cursor.execute(
+                "SELECT project_id,asset_type,storage_key,mime_type,size_bytes,checksum,rights_metadata "
+                "FROM assets WHERE id=%s",
+                (reference_asset_id,),
+            )
+            asset = cursor.fetchone()
+            if asset is None:
+                raise HTTPException(404, "reference image asset not found")
+            if asset[0] != shot[1]:
+                raise HTTPException(422, "reference image must belong to the shot project")
+            if asset[1] != "REFERENCE_IMAGE":
+                raise HTTPException(422, "reference asset must be an image")
+            if asset[3] not in {"image/jpeg", "image/png", "image/webp"}:
+                raise HTTPException(422, "reference image must be JPEG, PNG, or WebP")
+            rights = asset[6] or {}
+            if rights.get("usage_confirmed") is not True:
+                raise HTTPException(422, "reference image usage rights must be confirmed")
+            if (
+                rights.get("depicts_real_person") is True
+                and rights.get("likeness_consent_confirmed") is not True
+            ):
+                raise HTTPException(422, "likeness consent must be confirmed for a real person")
+            path = LocalStorage(settings.storage_root).path(asset[2])
+            try:
+                data = path.read_bytes()
+                if hashlib.sha256(data).hexdigest() != asset[5]:
+                    raise HTTPException(422, "reference image checksum does not match")
+                with Image.open(io.BytesIO(data)) as image:
+                    detected_mime = Image.MIME.get(image.format or "")
+                    image.verify()
+                with Image.open(io.BytesIO(data)) as image:
+                    width, height = image.size
+            except (OSError, UnidentifiedImageError) as exc:
+                raise HTTPException(422, "reference image content is invalid") from exc
+            if detected_mime != asset[3]:
+                raise HTTPException(422, "reference image MIME type does not match its content")
+            aspect_ratio = width / height
+            if not 0.5 <= aspect_ratio <= 2:
+                raise HTTPException(422, "reference image aspect ratio must be between 0.5 and 2")
+            request_data["reference_image"] = {
+                "asset_id": str(reference_asset_id),
+                "checksum": asset[5],
+                "storage_key": asset[2],
+                "mime_type": asset[3],
+                "width": width,
+                "height": height,
+                "center_crop_warning": abs(aspect_ratio - (16 / 9)) > 0.01,
+            }
+            derived_from = rights.get("derived_from_asset_id")
+            if derived_from:
+                cursor.execute(
+                    "SELECT 1 FROM assets WHERE id=%s AND project_id=%s "
+                    "AND asset_type='REFERENCE_IMAGE'",
+                    (derived_from, shot[1]),
+                )
+                if cursor.fetchone() is None:
+                    raise HTTPException(422, "derived image provenance source is invalid")
+                request_data["reference_image"]["derived_from_asset_id"] = str(derived_from)
         cursor.execute(
-            "INSERT INTO jobs(project_id,shot_id,job_type,status,idempotency_key,max_retries) VALUES (%s,%s,'VIDEO_GENERATION','QUEUED',%s,%s) ON CONFLICT (idempotency_key) DO NOTHING RETURNING id,status",
-            (shot[1], shot_id, idempotency_key, settings.max_retries),
+            "INSERT INTO jobs(project_id,shot_id,job_type,status,idempotency_key,max_retries,request_data) "
+            "VALUES (%s,%s,'VIDEO_GENERATION','QUEUED',%s,%s,%s) ON CONFLICT (idempotency_key) "
+            "DO NOTHING RETURNING id,status",
+            (shot[1], shot_id, idempotency_key, settings.max_retries, Jsonb(request_data)),
         )
         created = cursor.fetchone()
         if created is None:
             cursor.execute(
-                "SELECT id,status,shot_id FROM jobs WHERE idempotency_key=%s", (idempotency_key,)
+                "SELECT id,status,shot_id,request_data FROM jobs WHERE idempotency_key=%s",
+                (idempotency_key,),
             )
             existing = cursor.fetchone()
-            if existing[2] != shot_id:
+            if existing[2] != shot_id or existing[3] != request_data:
                 raise HTTPException(409, "idempotency key belongs to another request")
             conn.commit()
             return {"job_id": str(existing[0]), "status": existing[1], "deduplicated": True}
         job_id = created[0]
         record_event(
-            cursor, shot[1], "JOB_SUBMITTED", "job", job_id, {"job_type": "VIDEO_GENERATION"}
+            cursor,
+            shot[1],
+            "JOB_SUBMITTED",
+            "job",
+            job_id,
+            {
+                "job_type": "VIDEO_GENERATION",
+                "generation_mode": "image-to-video" if reference_asset_id else "text-to-video",
+                "reference_asset_id": str(reference_asset_id) if reference_asset_id else None,
+            },
         )
         conn.commit()
     enqueue(str(job_id))
@@ -433,7 +509,7 @@ def variants(shot_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
             "SELECT v.id,v.storage_key,v.mime_type,v.duration,v.review_status,v.created_at,v.generation_attempt_id,"
-            "a.attempt_number,a.job_id FROM shot_variants v JOIN generation_attempts a ON a.id=v.generation_attempt_id "
+            "a.attempt_number,a.job_id,a.parameters FROM shot_variants v JOIN generation_attempts a ON a.id=v.generation_attempt_id "
             "WHERE v.shot_id=%s ORDER BY v.created_at",
             (shot_id,),
         )
@@ -449,6 +525,7 @@ def variants(shot_id: UUID):
             "generation_attempt_id": str(r[6]),
             "attempt_number": r[7],
             "job_id": str(r[8]),
+            "provenance": r[9],
         }
         for r in rows
     ]

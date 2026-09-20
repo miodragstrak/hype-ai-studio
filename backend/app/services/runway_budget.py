@@ -32,7 +32,9 @@ def estimate_cost() -> dict[str, Any]:
     }
 
 
-def reserve_attempt(cursor, job: tuple, shot: tuple) -> tuple[str | None, bool]:
+def reserve_attempt(
+    cursor, job: tuple, shot: tuple, parameters: dict | None = None
+) -> tuple[str | None, bool]:
     cursor.execute("SELECT pg_advisory_xact_lock(%s)", (_BUDGET_LOCK_ID,))
     cursor.execute(
         "SELECT COALESCE(sum((cost_metadata->>'estimated_usd')::numeric),0) "
@@ -55,7 +57,7 @@ def reserve_attempt(cursor, job: tuple, shot: tuple) -> tuple[str | None, bool]:
                 job[0],
                 settings.runway_video_model,
                 shot[0],
-                Jsonb({}),
+                Jsonb(parameters or {}),
                 attempt_number,
                 Jsonb(cost),
                 Jsonb({"code": BudgetExceededError.code, "retryable": False}),
@@ -87,7 +89,7 @@ def reserve_attempt(cursor, job: tuple, shot: tuple) -> tuple[str | None, bool]:
             job[0],
             settings.runway_video_model,
             shot[0],
-            Jsonb({}),
+            Jsonb(parameters or {}),
             attempt_number,
             Jsonb(cost),
         ),

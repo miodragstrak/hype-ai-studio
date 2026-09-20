@@ -9,6 +9,7 @@ _BEARER = re.compile(r"(?i)(authorization\s*[:=]\s*)?bearer\s+[^\s,;]+")
 _SENSITIVE_QUERY = re.compile(
     r"(?i)([?&](?:key|api_key|apikey|token|access_token|signature|sig)=)[^&\s]+"
 )
+_RUNWAY_URI = re.compile(r"runway://[^\s,;'\"]+")
 _SENSITIVE_QUERY_KEYS = {"key", "api_key", "apikey", "token", "access_token", "signature", "sig"}
 
 
@@ -22,6 +23,7 @@ def sanitize_text(value: object) -> str:
         text = text.replace(openai_secret.get_secret_value(), REDACTED)
     text = _BEARER.sub(lambda match: f"{match.group(1) or ''}{REDACTED}", text)
     text = _SENSITIVE_QUERY.sub(lambda match: f"{match.group(1)}{REDACTED}", text)
+    text = _RUNWAY_URI.sub(REDACTED, text)
     try:
         parsed = urlsplit(text)
         if parsed.scheme and parsed.query:

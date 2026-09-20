@@ -33,11 +33,20 @@ class NormalizedStatus(StrEnum):
 
 
 @dataclass(frozen=True)
+class ReferenceImageInput:
+    asset_id: str
+    checksum: str
+    path: str
+    mime_type: str
+
+
+@dataclass(frozen=True)
 class GenerationRequest:
     prompt: str
     aspect_ratio: str
     target_duration: float
     reference_asset_ids: list[str] = field(default_factory=list)
+    reference_image: ReferenceImageInput | None = None
     correlation_id: str | None = None
     parameters: dict[str, Any] = field(default_factory=dict)
 

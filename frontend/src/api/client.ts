@@ -24,7 +24,11 @@ export const api = {
   shots: (id: string) => request<Shot[]>(`/projects/${id}/shots`), createShot: (id: string, body: { ordinal: number; title: string; prompt: string; intended_duration: number }) => request<Shot>(`/projects/${id}/shots`, json("POST", body)),
   updateShot: (id: string, body: Pick<Shot, "ordinal" | "title" | "prompt" | "intended_duration">) => request<Shot>(`/shots/${id}`, json("PUT", body)),
   reorderShots: (id: string, ids: string[]) => request(`/projects/${id}/shots/order`, json("PUT", { shot_ids: ids })),
-  generate: (id: string, key: string) => request<{ job_id: string; status: string }>(`/shots/${id}/generations?idempotency_key=${encodeURIComponent(key)}`, { method: "POST" }),
+  generate: (id: string, key: string, referenceAssetId?: string) => {
+    const query = new URLSearchParams({ idempotency_key: key });
+    if (referenceAssetId) query.set("reference_asset_id", referenceAssetId);
+    return request<{ job_id: string; status: string }>(`/shots/${id}/generations?${query}`, { method: "POST" });
+  },
   job: (id: string) => request<Job>(`/jobs/${id}`), variants: (id: string) => request<Variant[]>(`/shots/${id}/variants`),
   selectVariant: (shot: string, variant: string) => request(`/shots/${shot}/variants/${variant}/select`, { method: "POST" }),
   rejectVariant: (shot: string, variant: string) => request(`/shots/${shot}/variants/${variant}/reject`, { method: "POST" }),
