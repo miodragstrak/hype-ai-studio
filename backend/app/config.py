@@ -12,6 +12,14 @@ class Settings(BaseSettings):
     mock_provider_delay_seconds: float = 0.1
     mock_provider_failure_mode: str = "none"
     planning_provider: str = "mock"
+    openai_api_key: SecretStr | None = None
+    openai_planning_model: str = "gpt-5.6-sol"
+    openai_planning_timeout_seconds: float = 120
+    openai_planning_max_output_tokens: int = 12_000
+    openai_planning_input_usd_per_million: float = 4
+    openai_planning_output_usd_per_million: float = 20
+    openai_planning_soft_limit_usd: float = 2
+    openai_planning_hard_limit_usd: float = 5
     mock_planning_delay_seconds: float = 0.1
     mock_planning_failure_mode: str = "none"
     planning_max_shot_count: int = 24
@@ -33,8 +41,7 @@ class Settings(BaseSettings):
     ffmpeg_executable: str = "ffmpeg"
     ffprobe_executable: str = "ffprobe"
     cors_origins: str = (
-        "http://localhost:5173,http://127.0.0.1:5173,"
-        "http://localhost:5174,http://127.0.0.1:5174"
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174"
     )
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -65,8 +72,25 @@ class Settings(BaseSettings):
                 raise ValueError(f"{name} must be greater than zero")
         if self.runway_hard_limit_usd < self.runway_soft_limit_usd:
             raise ValueError("RUNWAY_HARD_LIMIT_USD must be at least RUNWAY_SOFT_LIMIT_USD")
-        if self.planning_provider != "mock":
-            raise ValueError("PLANNING_PROVIDER must be mock in HYPE-STUDIO-002A")
+        if self.planning_provider not in {"mock", "openai"}:
+            raise ValueError("PLANNING_PROVIDER must be mock or openai")
+        if self.planning_provider == "openai" and not self.openai_api_key:
+            raise ValueError("OPENAI_API_KEY is required when PLANNING_PROVIDER=openai")
+        if self.openai_planning_model != "gpt-5.6-sol":
+            raise ValueError("OPENAI_PLANNING_MODEL must be gpt-5.6-sol")
+        planning_positive = {
+            "OPENAI_PLANNING_TIMEOUT_SECONDS": self.openai_planning_timeout_seconds,
+            "OPENAI_PLANNING_MAX_OUTPUT_TOKENS": self.openai_planning_max_output_tokens,
+            "OPENAI_PLANNING_INPUT_USD_PER_MILLION": self.openai_planning_input_usd_per_million,
+            "OPENAI_PLANNING_OUTPUT_USD_PER_MILLION": self.openai_planning_output_usd_per_million,
+            "OPENAI_PLANNING_SOFT_LIMIT_USD": self.openai_planning_soft_limit_usd,
+            "OPENAI_PLANNING_HARD_LIMIT_USD": self.openai_planning_hard_limit_usd,
+        }
+        for name, value in planning_positive.items():
+            if value <= 0:
+                raise ValueError(f"{name} must be greater than zero")
+        if self.openai_planning_hard_limit_usd < self.openai_planning_soft_limit_usd:
+            raise ValueError("OPENAI_PLANNING_HARD_LIMIT_USD must be at least the soft limit")
         if self.mock_planning_delay_seconds < 0:
             raise ValueError("MOCK_PLANNING_DELAY_SECONDS must not be negative")
         if not 1 <= self.planning_max_shot_count <= 48:

@@ -35,9 +35,10 @@ def test_request_validation_and_deterministic_mock_result():
     assert sum(shot.duration_seconds for shot in result.shots) == pytest.approx(17)
     assert "No logos" in result.treatment
     assert all(shot.reference_asset_ids == ["asset-1"] for shot in result.shots)
-    assert validate_plan(
-        result, target_duration=17, maximum_shots=4, allowed_asset_ids={"asset-1"}
-    ) == result
+    assert (
+        validate_plan(result, target_duration=17, maximum_shots=4, allowed_asset_ids={"asset-1"})
+        == result
+    )
 
 
 def test_request_and_result_validation_reject_bad_data():

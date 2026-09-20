@@ -70,6 +70,24 @@ behavior observable, while `MOCK_PLANNING_FAILURE_MODE` supports `transient:N`, 
 `malformed` test cases. Planning and video providers are explicitly pinned to mocks in subprocess
 integration tests, so the suite cannot make a paid provider request.
 
+### Opt-in OpenAI planner
+
+Set `PLANNING_PROVIDER=openai` and configure `OPENAI_API_KEY` only in the server-side environment to
+use the official OpenAI SDK with the Responses API, Structured Outputs, and `gpt-5.6-sol`. Mock
+planning remains the default. The adapter disables SDK retries, uses one request per worker attempt,
+does not enable tools or web search, and never sends asset binaries.
+
+OpenAI planning reserves estimated input plus maximum-output cost before submission under a database
+lock. The development-wide soft alert defaults to `$2`; the hard cap defaults to `$5`. Authoritative
+token usage, response ID, request timestamps, and clearly labeled estimated cost are stored in event
+metadata. The application does not claim authoritative dollar cost when OpenAI only returns token
+usage. A persisted parsed response is reused after worker redelivery; an ambiguous submission without
+a response ID requires manual reconciliation.
+
+The adapter currently uses the documented promotional `gpt-5.6-sol` rates of `$4` per million input
+tokens and `$20` per million output tokens. These settings are explicit environment values so pricing
+changes can be reviewed without changing orchestration code.
+
 ## Runway Dev
 
 The worker integrates with Runway through the official Python SDK and the existing provider-neutral

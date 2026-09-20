@@ -164,9 +164,7 @@ def test_versioning_approval_and_materialization_are_atomic_and_idempotent(
         )
     }
     edited["concept_title"] = "Producer revision"
-    version = client.post(
-        f"/projects/{project_id}/plans/{plan['id']}/versions", json=edited
-    )
+    version = client.post(f"/projects/{project_id}/plans/{plan['id']}/versions", json=edited)
     assert version.status_code == 201
     revised = version.json()
     assert revised["version"] == 2
@@ -194,7 +192,12 @@ def test_versioning_approval_and_materialization_are_atomic_and_idempotent(
                 "SELECT event_type FROM events WHERE project_id=%s", (project_id,)
             )
         }
-    assert {"PLAN_GENERATED", "PLAN_VERSION_CREATED", "PLAN_APPROVED", "PLAN_SHOTS_MATERIALIZED"} <= events
+    assert {
+        "PLAN_GENERATED",
+        "PLAN_VERSION_CREATED",
+        "PLAN_APPROVED",
+        "PLAN_SHOTS_MATERIALIZED",
+    } <= events
 
 
 def test_approval_preserves_manual_shots_and_controls_replacement(client, worker_process, db):
@@ -227,10 +230,15 @@ def test_approval_preserves_manual_shots_and_controls_replacement(client, worker
     assert shots[0]["id"] == manual.json()["id"]
     assert shots[0]["source_plan_id"] is None
     assert all(shot["source_plan_id"] == second["id"] for shot in shots[1:])
-    assert client.get(f"/projects/{project_id}/plans/{first['id']}").json()["status"] == "SUPERSEDED"
+    assert (
+        client.get(f"/projects/{project_id}/plans/{first['id']}").json()["status"] == "SUPERSEDED"
+    )
 
     with db() as conn:
-        conn.execute("UPDATE shots SET title='Producer changed this' WHERE source_plan_id=%s", (second["id"],))
+        conn.execute(
+            "UPDATE shots SET title='Producer changed this' WHERE source_plan_id=%s",
+            (second["id"],),
+        )
     third = client.post(
         f"/projects/{project_id}/plans/{second['id']}/versions", json=second_body
     ).json()
@@ -256,9 +264,12 @@ def test_database_constraints_and_snapshot_immutability(client, worker_process, 
         with pytest.raises(psycopg.errors.RaiseException):
             conn.execute("UPDATE project_plans SET treatment='mutated' WHERE id=%s", (plan["id"],))
         conn.rollback()
-        assert conn.execute(
-            "SELECT treatment FROM project_plans WHERE id=%s", (plan["id"],)
-        ).fetchone()[0] == plan["treatment"]
+        assert (
+            conn.execute(
+                "SELECT treatment FROM project_plans WHERE id=%s", (plan["id"],)
+            ).fetchone()[0]
+            == plan["treatment"]
+        )
 
 
 def test_materialization_rolls_back_completely_on_insert_failure(client, worker_process, db):
@@ -277,12 +288,18 @@ def test_materialization_rolls_back_completely_on_insert_failure(client, worker_
     with pytest.raises(Exception, match="controlled"):
         client.post(f"/projects/{project_id}/plans/{plan['id']}/approve")
     with db() as conn:
-        assert conn.execute(
-            "SELECT count(*) FROM shots WHERE source_plan_id=%s", (plan["id"],)
-        ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT status FROM project_plans WHERE id=%s", (plan["id"],)
-        ).fetchone()[0] == "DRAFT"
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM shots WHERE source_plan_id=%s", (plan["id"],)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute("SELECT status FROM project_plans WHERE id=%s", (plan["id"],)).fetchone()[
+                0
+            ]
+            == "DRAFT"
+        )
         conn.execute("DROP TRIGGER reject_second_plan_shot ON shots")
         conn.execute("DROP FUNCTION reject_second_plan_shot()")
 

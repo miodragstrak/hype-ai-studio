@@ -86,6 +86,10 @@ def clean_state(integration_environment):
     settings.mock_provider_delay_seconds = 0.05
     settings.mock_provider_failure_mode = "none"
     settings.planning_provider = "mock"
+    settings.openai_api_key = None
+    settings.openai_planning_soft_limit_usd = 2
+    settings.openai_planning_hard_limit_usd = 5
+    settings.openai_planning_max_output_tokens = 12_000
     settings.mock_planning_delay_seconds = 0.05
     settings.mock_planning_failure_mode = "none"
     settings.video_provider = "mock"
@@ -125,6 +129,7 @@ def worker_process(
         delay: float = 0.05,
         planning_failure_mode: str = "none",
         planning_delay: float = 0.05,
+        extra_env: dict[str, str] | None = None,
     ) -> subprocess.Popen[str]:
         env = os.environ.copy()
         env.update(
@@ -135,6 +140,7 @@ def worker_process(
             VIDEO_PROVIDER="mock",
             PLANNING_PROVIDER="mock",
             RUNWAYML_API_SECRET="",
+            OPENAI_API_KEY="",
             MOCK_PROVIDER_DELAY_SECONDS=str(delay),
             MOCK_PROVIDER_FAILURE_MODE=failure_mode,
             MOCK_PLANNING_DELAY_SECONDS=str(planning_delay),
@@ -144,6 +150,7 @@ def worker_process(
             FFPROBE_EXECUTABLE=settings.ffprobe_executable,
             PYTHONUNBUFFERED="1",
         )
+        env.update(extra_env or {})
         process = subprocess.Popen(
             [sys.executable, "-m", "backend.app.worker"],
             cwd=ROOT,

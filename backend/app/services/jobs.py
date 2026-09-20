@@ -7,7 +7,7 @@ from backend.app.db import connection
 from backend.app.domain.models import JobStatus
 
 ALLOWED = {
-    JobStatus.QUEUED: {JobStatus.SUBMITTING, JobStatus.CANCEL_REQUESTED},
+    JobStatus.QUEUED: {JobStatus.SUBMITTING, JobStatus.CANCEL_REQUESTED, JobStatus.FAILED},
     JobStatus.SUBMITTING: {
         JobStatus.PROVIDER_PENDING,
         JobStatus.PROCESSING,

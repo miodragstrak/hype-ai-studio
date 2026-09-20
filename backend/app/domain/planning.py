@@ -5,6 +5,8 @@ from pydantic import BaseModel, Field, model_validator
 
 class PlanningRequest(BaseModel):
     project_id: str
+    project_type: Literal["MUSIC_VIDEO"] = "MUSIC_VIDEO"
+    project_title: str = "Untitled music video"
     creative_brief: str = Field(min_length=1)
     target_duration_seconds: float = Field(gt=0, le=600)
     aspect_ratio: str

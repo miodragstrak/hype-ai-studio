@@ -50,22 +50,47 @@ def reserve_attempt(cursor, job: tuple, shot: tuple) -> tuple[str | None, bool]:
             "(project_id,shot_id,job_id,provider,model,submitted_prompt,parameters,attempt_number,status,started_at,completed_at,cost_metadata,error_data) "
             "VALUES (%s,%s,%s,'runway',%s,%s,%s,%s,'REJECTED',now(),now(),%s,%s) RETURNING id",
             (
-                job[1], job[2], job[0], settings.runway_video_model, shot[0], Jsonb({}),
-                attempt_number, Jsonb(cost), Jsonb({"code": BudgetExceededError.code, "retryable": False}),
+                job[1],
+                job[2],
+                job[0],
+                settings.runway_video_model,
+                shot[0],
+                Jsonb({}),
+                attempt_number,
+                Jsonb(cost),
+                Jsonb({"code": BudgetExceededError.code, "retryable": False}),
             ),
         )
         attempt_id = cursor.fetchone()[0]
         cursor.execute(
             "INSERT INTO events(project_id,event_type,actor_type,entity_type,entity_id,payload) "
             "VALUES (%s,'RUNWAY_HARD_LIMIT_REJECTED','worker','generation_attempt',%s,%s)",
-            (job[1], attempt_id, Jsonb({"projected_usd": float(projected), "hard_limit_usd": settings.runway_hard_limit_usd})),
+            (
+                job[1],
+                attempt_id,
+                Jsonb(
+                    {
+                        "projected_usd": float(projected),
+                        "hard_limit_usd": settings.runway_hard_limit_usd,
+                    }
+                ),
+            ),
         )
         return None, False
     cursor.execute(
         "INSERT INTO generation_attempts "
         "(project_id,shot_id,job_id,provider,model,submitted_prompt,parameters,attempt_number,status,started_at,cost_metadata) "
         "VALUES (%s,%s,%s,'runway',%s,%s,%s,%s,'RESERVED',now(),%s) RETURNING id",
-        (job[1], job[2], job[0], settings.runway_video_model, shot[0], Jsonb({}), attempt_number, Jsonb(cost)),
+        (
+            job[1],
+            job[2],
+            job[0],
+            settings.runway_video_model,
+            shot[0],
+            Jsonb({}),
+            attempt_number,
+            Jsonb(cost),
+        ),
     )
     attempt_id = cursor.fetchone()[0]
     warned = projected >= Decimal(str(settings.runway_soft_limit_usd))
@@ -73,6 +98,15 @@ def reserve_attempt(cursor, job: tuple, shot: tuple) -> tuple[str | None, bool]:
         cursor.execute(
             "INSERT INTO events(project_id,event_type,actor_type,entity_type,entity_id,payload) "
             "VALUES (%s,'RUNWAY_SOFT_LIMIT_WARNING','worker','generation_attempt',%s,%s)",
-            (job[1], attempt_id, Jsonb({"projected_usd": float(projected), "soft_limit_usd": settings.runway_soft_limit_usd})),
+            (
+                job[1],
+                attempt_id,
+                Jsonb(
+                    {
+                        "projected_usd": float(projected),
+                        "soft_limit_usd": settings.runway_soft_limit_usd,
+                    }
+                ),
+            ),
         )
     return str(attempt_id), warned
