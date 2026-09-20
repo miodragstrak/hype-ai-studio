@@ -2,11 +2,13 @@ import time
 from pathlib import Path
 
 from psycopg.types.json import Jsonb
+from pydantic import ValidationError
 
 from backend.app.config import settings
 from backend.app.db import connection
 from backend.app.domain.models import GenerationRequest, JobStatus, NormalizedStatus
-from backend.app.providers.factory import create_video_provider
+from backend.app.domain.planning import PlanningRequest, validate_plan
+from backend.app.providers.factory import create_planning_provider, create_video_provider
 from backend.app.providers.runway import AmbiguousProviderSubmissionError
 from backend.app.queue import dequeue, enqueue
 from backend.app.render import compose_video
@@ -327,6 +329,88 @@ def process_render(render_id: str) -> None:
             conn.commit()
 
 
+def process_planning(job_id: str) -> None:
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT id,project_id,retry_count,max_retries,status,request_data FROM jobs WHERE id=%s",
+            (job_id,),
+        )
+        job = cursor.fetchone()
+        if not job or job[4] in {"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT"}:
+            return
+        cursor.execute("SELECT 1 FROM project_plans WHERE source_job_id=%s", (job[0],))
+        if cursor.fetchone():
+            cursor.execute("UPDATE jobs SET status='SUCCEEDED',completed_at=COALESCE(completed_at,now()) WHERE id=%s", (job[0],))
+            conn.commit()
+            return
+    failure_mode = settings.mock_planning_failure_mode
+    if failure_mode.startswith("transient:"):
+        failures = int(failure_mode.partition(":")[2])
+        failure_mode = "transient" if job[2] < failures else "none"
+    provider = create_planning_provider(failure_mode)
+    try:
+        transition(job[0], JobStatus.SUBMITTING)
+        request = PlanningRequest.model_validate(job[5])
+        provider_id = provider.submit_plan(request)
+        transition(job[0], JobStatus.PROVIDER_PENDING)
+        transition(job[0], JobStatus.PROCESSING)
+        while provider.get_status(provider_id).status == NormalizedStatus.PENDING:
+            time.sleep(0.01)
+        status = provider.get_status(provider_id)
+        if status.status != NormalizedStatus.SUCCEEDED:
+            exception = RuntimeError(status.error.message if status.error else "planning failed")
+            exception.retryable = bool(status.error and status.error.retryable)  # type: ignore[attr-defined]
+            raise exception
+        result = provider.get_result(provider_id)
+        allowed_assets = {str(asset["id"]) for asset in request.reference_assets}
+        validate_plan(
+            result,
+            target_duration=request.target_duration_seconds,
+            maximum_shots=request.maximum_shot_count,
+            allowed_asset_ids=allowed_assets,
+        )
+        with connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT id FROM projects WHERE id=%s FOR UPDATE", (job[1],))
+            cursor.execute("SELECT COALESCE(max(version),0)+1 FROM project_plans WHERE project_id=%s", (job[1],))
+            version = cursor.fetchone()[0]
+            cursor.execute(
+                "INSERT INTO project_plans(project_id,version,planning_inputs,concept_title,logline,treatment,creative_direction,shot_plan,provider,model,prompt_schema_version,source_job_id) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (source_job_id) DO NOTHING RETURNING id",
+                (
+                    job[1], version, Jsonb(request.model_dump()), result.concept_title,
+                    result.logline, result.treatment, Jsonb(result.creative_direction.model_dump()),
+                    Jsonb([shot.model_dump() for shot in result.shots]), provider.provider,
+                    provider.model, result.schema_version, job[0],
+                ),
+            )
+            plan = cursor.fetchone()
+            if plan:
+                cursor.execute(
+                    "INSERT INTO events(project_id,event_type,actor_type,entity_type,entity_id,payload) VALUES (%s,'PLAN_GENERATED','worker','project_plan',%s,%s)",
+                    (job[1], plan[0], Jsonb({"version": version, "job_id": str(job[0])})),
+                )
+            conn.commit()
+        transition(job[0], JobStatus.SUCCEEDED)
+    except Exception as exc:  # noqa: BLE001 - normalized into persisted job error
+        retryable = bool(getattr(exc, "retryable", not isinstance(exc, (ValidationError, ValueError))))
+        error = {"message": str(exc), "retryable": retryable, "type": type(exc).__name__}
+        if retryable and job[2] < job[3]:
+            with connection() as conn, conn.cursor() as cursor:
+                cursor.execute("UPDATE jobs SET retry_count=retry_count+1 WHERE id=%s", (job[0],))
+                conn.commit()
+            transition(job[0], JobStatus.RETRY_SCHEDULED, error)
+            enqueue(str(job[0]), "planning")
+        else:
+            transition(job[0], JobStatus.FAILED, error)
+            with connection() as conn, conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO events(project_id,event_type,actor_type,entity_id,payload,entity_type) "
+                    "VALUES (%s,'PLAN_GENERATION_FAILED','worker',%s,%s,'job')",
+                    (job[1], job[0], Jsonb(error)),
+                )
+                conn.commit()
+
+
 def run() -> None:
     while True:
         item = dequeue()
@@ -336,6 +420,8 @@ def run() -> None:
             process_generation(item["job_id"])
         elif item["kind"] == "render":
             process_render(item["job_id"])
+        elif item["kind"] == "planning":
+            process_planning(item["job_id"])
 
 
 if __name__ == "__main__":

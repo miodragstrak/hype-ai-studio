@@ -1,4 +1,4 @@
-import type { ActivityEvent, Asset, Job, Project, Render, Shot, Variant } from "../types";
+import type { ActivityEvent, Asset, Job, Plan, PlanGenerateInput, PlanSummary, Project, Render, Shot, Variant } from "../types";
 
 export const API_BASE = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
 export class ApiError extends Error { constructor(public status: number, message: string) { super(message); } }
@@ -16,6 +16,11 @@ export const api = {
   projects: () => request<Project[]>("/projects"), project: (id: string) => request<Project>(`/projects/${id}`),
   createProject: (body: { title: string; creative_brief: string }) => request<Project>("/projects", json("POST", { ...body, project_type: "MUSIC_VIDEO", aspect_ratio: "16:9" })),
   assets: (id: string) => request<Asset[]>(`/projects/${id}/assets`), uploadAsset: (id: string, data: FormData) => request<{ id: string }>(`/projects/${id}/assets`, { method: "POST", body: data }),
+  plans: (id: string) => request<PlanSummary[]>(`/projects/${id}/plans`),
+  plan: (projectId: string, planId: string) => request<Plan>(`/projects/${projectId}/plans/${planId}`),
+  generatePlan: (id: string, body: PlanGenerateInput) => request<{ job_id: string; status: string; deduplicated: boolean }>(`/projects/${id}/plans/generate`, json("POST", body)),
+  createPlanVersion: (projectId: string, planId: string, body: Pick<Plan, "schema_version" | "concept_title" | "logline" | "treatment" | "creative_direction" | "shots">) => request<Plan>(`/projects/${projectId}/plans/${planId}/versions`, json("POST", body)),
+  approvePlan: (projectId: string, planId: string) => request<{ plan_id: string; status: string; created_shot_ids: string[]; idempotent: boolean }>(`/projects/${projectId}/plans/${planId}/approve`, { method: "POST" }),
   shots: (id: string) => request<Shot[]>(`/projects/${id}/shots`), createShot: (id: string, body: { ordinal: number; title: string; prompt: string; intended_duration: number }) => request<Shot>(`/projects/${id}/shots`, json("POST", body)),
   updateShot: (id: string, body: Pick<Shot, "ordinal" | "title" | "prompt" | "intended_duration">) => request<Shot>(`/shots/${id}`, json("PUT", body)),
   reorderShots: (id: string, ids: string[]) => request(`/projects/${id}/shots/order`, json("PUT", { shot_ids: ids })),

@@ -23,6 +23,7 @@ ALLOWED = {
     },
     JobStatus.PROCESSING: {
         JobStatus.DOWNLOADING,
+        JobStatus.SUCCEEDED,
         JobStatus.CANCEL_REQUESTED,
         JobStatus.FAILED,
         JobStatus.RETRY_SCHEDULED,
