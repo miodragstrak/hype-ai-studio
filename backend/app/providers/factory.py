@@ -1,6 +1,8 @@
 from backend.app.config import settings
 from backend.app.providers.base import VideoProvider
 from backend.app.providers.mock import MockVideoProvider
+from backend.app.providers.mock_planning import MockPlanningProvider
+from backend.app.providers.planning import PlanningProvider
 from backend.app.providers.runway import RunwayVideoProvider
 
 
@@ -22,3 +24,9 @@ def create_video_provider(failure_mode: str = "none") -> VideoProvider:
             settings.runway_download_max_bytes,
         )
     raise ValueError(f"Unsupported video provider: {settings.video_provider}")
+
+
+def create_planning_provider(failure_mode: str = "none") -> PlanningProvider:
+    if settings.planning_provider == "mock":
+        return MockPlanningProvider(settings.mock_planning_delay_seconds, failure_mode)
+    raise ValueError(f"Unsupported planning provider: {settings.planning_provider}")

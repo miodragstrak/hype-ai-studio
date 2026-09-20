@@ -4,7 +4,7 @@ This spike proves a local asynchronous path for a music-video project: planned s
 
 ## Architecture
 
-`frontend/` is a minimal Vite placeholder. `backend/app` is the shared FastAPI, domain, provider, storage, queue, and worker package. PostgreSQL is the lifecycle source of truth; Redis carries work notifications; local filesystem storage holds artifacts. The migration contains exactly the eight approved tables.
+`frontend/` is a Vite producer workspace. `backend/app` is the shared FastAPI, domain, provider, storage, queue, and worker package. PostgreSQL is the lifecycle source of truth; Redis carries work notifications; local filesystem storage holds artifacts. The initial eight-table schema is extended by one `project_plans` table for immutable, versioned planning snapshots.
 
 ## Ubuntu setup
 
@@ -17,6 +17,7 @@ pip install -e '.[dev]'
 cp .env.example .env
 docker compose up -d postgres redis
 psql "$DATABASE_URL" -f supabase/migrations/001_initial_schema.sql
+psql "$DATABASE_URL" -f supabase/migrations/002_project_plans.sql
 uvicorn backend.app.api:app --reload
 python -m backend.app.worker
 cd frontend && npm install && npm run dev
@@ -55,6 +56,19 @@ cd frontend && npm run dev
 ```
 
 Frontend checks are `npm run lint`, `npm test`, and `npm run build`.
+
+## Music video planning
+
+The Plan stage at `/projects/:projectId/plan` submits a provider-neutral planning request to Redis.
+The separate worker uses the deterministic mock planner by default, validates its structured result,
+and stores an immutable draft. Producer edits create child versions; they never mutate an existing
+snapshot. Approval validates the snapshot again and atomically materializes traceable shots without
+starting video generation.
+
+Set `PLANNING_PROVIDER=mock` for all local and test use. `MOCK_PLANNING_DELAY_SECONDS` makes async
+behavior observable, while `MOCK_PLANNING_FAILURE_MODE` supports `transient:N`, `permanent`, and
+`malformed` test cases. Planning and video providers are explicitly pinned to mocks in subprocess
+integration tests, so the suite cannot make a paid provider request.
 
 ## Runway Dev
 

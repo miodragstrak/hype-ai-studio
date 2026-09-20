@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     storage_root: Path = Path(".data/storage")
     mock_provider_delay_seconds: float = 0.1
     mock_provider_failure_mode: str = "none"
+    planning_provider: str = "mock"
+    mock_planning_delay_seconds: float = 0.1
+    mock_planning_failure_mode: str = "none"
+    planning_max_shot_count: int = 24
+    planning_prompt_schema_version: str = "music-video-plan-v1"
     video_provider: str = "mock"
     runwayml_api_secret: SecretStr | None = None
     runway_video_model: str = "gen4.5"
@@ -60,6 +65,12 @@ class Settings(BaseSettings):
                 raise ValueError(f"{name} must be greater than zero")
         if self.runway_hard_limit_usd < self.runway_soft_limit_usd:
             raise ValueError("RUNWAY_HARD_LIMIT_USD must be at least RUNWAY_SOFT_LIMIT_USD")
+        if self.planning_provider != "mock":
+            raise ValueError("PLANNING_PROVIDER must be mock in HYPE-STUDIO-002A")
+        if self.mock_planning_delay_seconds < 0:
+            raise ValueError("MOCK_PLANNING_DELAY_SECONDS must not be negative")
+        if not 1 <= self.planning_max_shot_count <= 48:
+            raise ValueError("PLANNING_MAX_SHOT_COUNT must be between 1 and 48")
         return self
 
 

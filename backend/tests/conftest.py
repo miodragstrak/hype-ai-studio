@@ -19,7 +19,7 @@ from backend.app.api import app
 from backend.app.config import settings
 
 ROOT = Path(__file__).resolve().parents[2]
-MIGRATION = ROOT / "supabase/migrations/001_initial_schema.sql"
+MIGRATIONS = sorted((ROOT / "supabase/migrations").glob("*.sql"))
 ADMIN_URL = os.getenv(
     "TEST_DATABASE_ADMIN_URL",
     "postgresql://hype_test:hype_test@127.0.0.1:55432/postgres",
@@ -42,7 +42,8 @@ def database_url() -> Iterator[str]:
         conn.execute(f'CREATE DATABASE "{database_name}"')
     url = ADMIN_URL.rsplit("/", 1)[0] + f"/{database_name}"
     with psycopg.connect(url) as conn:
-        conn.execute(MIGRATION.read_text())
+        for migration in MIGRATIONS:
+            conn.execute(migration.read_text())
     yield url
     with psycopg.connect(ADMIN_URL, autocommit=True) as conn:
         conn.execute(
@@ -78,12 +79,15 @@ def integration_environment(database_url: str):
 def clean_state(integration_environment):
     with psycopg.connect(integration_environment["database_url"]) as conn:
         conn.execute(
-            "TRUNCATE events,renders,shot_variants,generation_attempts,jobs,shots,assets,projects "
+            "TRUNCATE events,renders,shot_variants,generation_attempts,shots,project_plans,jobs,assets,projects "
             "RESTART IDENTITY CASCADE"
         )
     integration_environment["redis"].delete(integration_environment["queue_name"])
     settings.mock_provider_delay_seconds = 0.05
     settings.mock_provider_failure_mode = "none"
+    settings.planning_provider = "mock"
+    settings.mock_planning_delay_seconds = 0.05
+    settings.mock_planning_failure_mode = "none"
     settings.video_provider = "mock"
     settings.runwayml_api_secret = None
     settings.runway_soft_limit_usd = 10
@@ -115,15 +119,26 @@ def worker_process(
 ) -> Iterator[Callable[..., subprocess.Popen[str]]]:
     processes: list[subprocess.Popen[str]] = []
 
-    def start(*, failure_mode: str = "none", delay: float = 0.05) -> subprocess.Popen[str]:
+    def start(
+        *,
+        failure_mode: str = "none",
+        delay: float = 0.05,
+        planning_failure_mode: str = "none",
+        planning_delay: float = 0.05,
+    ) -> subprocess.Popen[str]:
         env = os.environ.copy()
         env.update(
             DATABASE_URL=integration_environment["database_url"],
             REDIS_URL=TEST_REDIS_URL,
             STORAGE_ROOT=str(integration_environment["storage_root"]),
             QUEUE_NAME=integration_environment["queue_name"],
+            VIDEO_PROVIDER="mock",
+            PLANNING_PROVIDER="mock",
+            RUNWAYML_API_SECRET="",
             MOCK_PROVIDER_DELAY_SECONDS=str(delay),
             MOCK_PROVIDER_FAILURE_MODE=failure_mode,
+            MOCK_PLANNING_DELAY_SECONDS=str(planning_delay),
+            MOCK_PLANNING_FAILURE_MODE=planning_failure_mode,
             MAX_RETRIES=str(settings.max_retries),
             FFMPEG_EXECUTABLE=settings.ffmpeg_executable,
             FFPROBE_EXECUTABLE=settings.ffprobe_executable,

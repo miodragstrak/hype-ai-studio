@@ -5,7 +5,7 @@ from uuid import uuid4
 import psycopg
 import pytest
 
-from backend.tests.conftest import ADMIN_URL, MIGRATION
+from backend.tests.conftest import ADMIN_URL, MIGRATIONS
 
 pytestmark = pytest.mark.integration
 
@@ -18,6 +18,7 @@ EXPECTED_TABLES = {
     "shot_variants",
     "renders",
     "events",
+    "project_plans",
 }
 
 
@@ -28,7 +29,8 @@ def test_migration_on_clean_database_has_exact_schema_and_constraints():
     url = ADMIN_URL.rsplit("/", 1)[0] + f"/{database_name}"
     try:
         with psycopg.connect(url) as conn:
-            conn.execute(MIGRATION.read_text())
+            for migration in MIGRATIONS:
+                conn.execute(migration.read_text())
             tables = {
                 row[0]
                 for row in conn.execute(
