@@ -110,6 +110,20 @@ task cost. These are temporary development-wide controls, not customer billing: 
 soft limit records a warning, while a projected total above the `$30` hard limit is rejected before
 submission. Autobilling is not assumed or enabled.
 
+### Image-to-video references
+
+A shot generation may optionally select one project `REFERENCE_IMAGE` with JPEG, PNG, or WebP
+content. The API validates the stored checksum, real image content, MIME type, 0.5–2 aspect ratio,
+confirmed usage rights, and likeness consent whenever the metadata declares a real person. The
+original remains in private application storage; the worker uses the official ephemeral Runway
+upload and keeps the resulting `runway://` URI in memory only. Gen-4.5 then uses that upload as the
+first frame for one five-second `1280:720` image-to-video task.
+
+Reference asset ID and checksum are preserved in job, attempt, event, and variant evidence. An
+approved derived crop can carry `derived_from_asset_id` in its rights metadata to retain provenance
+to the original asset. Portrait or non-16:9 references produce a center-crop warning; the source is
+never silently modified. Text-to-video remains available when the reference selector is empty.
+
 The worker submits once, persists the task ID, polls without the SDK's blocking wait helper, and
 copies successful output into local storage before the temporary URL expires. A submission exception
 is treated as ambiguous and non-retryable because Runway may already have accepted a paid task;

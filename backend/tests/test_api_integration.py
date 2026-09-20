@@ -36,8 +36,11 @@ def create_shot(client, project_id: str, ordinal: int = 1, duration: float = 0.3
     return response.json()["id"]
 
 
-def submit_generation(client, shot_id: str, key: str):
-    return client.post(f"/shots/{shot_id}/generations", params={"idempotency_key": key})
+def submit_generation(client, shot_id: str, key: str, reference_asset_id: str | None = None):
+    params = {"idempotency_key": key}
+    if reference_asset_id:
+        params["reference_asset_id"] = reference_asset_id
+    return client.post(f"/shots/{shot_id}/generations", params=params)
 
 
 def test_project_upload_shot_job_lookup_events_and_validation(client, db, integration_environment):

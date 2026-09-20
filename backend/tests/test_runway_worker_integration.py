@@ -1,8 +1,12 @@
+import json
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from pathlib import Path
 from threading import Lock
+from uuid import uuid4
 
 import pytest
+from PIL import Image
 from psycopg.types.json import Jsonb
 from pydantic import SecretStr
 
@@ -71,6 +75,123 @@ def runway_settings(tmp_path):
     output = tmp_path / "provider.mp4"
     output.write_bytes(b"fake-video")
     return output
+
+
+def image_bytes(size=(1280, 720), image_format="PNG"):
+    output = BytesIO()
+    Image.new("RGB", size, "silver").save(output, format=image_format)
+    return output.getvalue()
+
+
+def upload_reference(client, project_id, rights=None, mime_type="image/png", size=(1280, 720)):
+    rights = rights or {
+        "source": "synthetic test",
+        "usage_confirmed": True,
+        "depicts_real_person": False,
+    }
+    response = client.post(
+        f"/projects/{project_id}/assets",
+        files={"file": ("reference.png", image_bytes(size), mime_type)},
+        data={"asset_type": "REFERENCE_IMAGE", "rights_metadata": json.dumps(rights)},
+    )
+    assert response.status_code == 201
+    return response.json()["id"]
+
+
+def test_reference_validation_before_queueing(client):
+    project_id = create_project(client)
+    other_project = create_project(client, "Other project")
+    shot_id = create_shot(client, project_id, duration=5)
+    missing = submit_generation(client, shot_id, "missing-reference", str(uuid4()))
+    assert missing.status_code == 404
+
+    cross_project = upload_reference(client, other_project)
+    assert submit_generation(client, shot_id, "cross-project", cross_project).status_code == 422
+
+    missing_rights = upload_reference(client, project_id, {"usage_confirmed": False})
+    response = submit_generation(client, shot_id, "missing-rights", missing_rights)
+    assert response.status_code == 422
+    assert "rights" in response.json()["detail"]
+
+    missing_consent = upload_reference(
+        client,
+        project_id,
+        {"usage_confirmed": True, "depicts_real_person": True},
+    )
+    response = submit_generation(client, shot_id, "missing-consent", missing_consent)
+    assert response.status_code == 422
+    assert "likeness consent" in response.json()["detail"]
+
+    bad_aspect = upload_reference(client, project_id, size=(200, 1000))
+    assert submit_generation(client, shot_id, "bad-aspect", bad_aspect).status_code == 422
+
+    audio = client.post(
+        f"/projects/{project_id}/assets",
+        files={"file": ("not-image.wav", b"audio", "audio/wav")},
+        data={
+            "asset_type": "AUDIO",
+            "rights_metadata": json.dumps({"usage_confirmed": True}),
+        },
+    ).json()["id"]
+    assert submit_generation(client, shot_id, "not-image", audio).status_code == 422
+
+    gif = client.post(
+        f"/projects/{project_id}/assets",
+        files={"file": ("reference.gif", image_bytes(image_format="GIF"), "image/gif")},
+        data={
+            "asset_type": "REFERENCE_IMAGE",
+            "rights_metadata": json.dumps({"usage_confirmed": True}),
+        },
+    ).json()["id"]
+    response = submit_generation(client, shot_id, "bad-mime", gif)
+    assert response.status_code == 422
+    assert "JPEG, PNG, or WebP" in response.json()["detail"]
+
+
+def test_image_reference_provenance_and_idempotent_variant(client, db, monkeypatch, tmp_path):
+    output = runway_settings(tmp_path)
+    provider = FakeRunwayProvider(output)
+    monkeypatch.setattr("backend.app.worker.create_video_provider", lambda *_: provider)
+    project_id = create_project(client)
+    shot_id = create_shot(client, project_id, duration=5)
+    asset_id = upload_reference(
+        client,
+        project_id,
+        {
+            "source": "licensed test",
+            "usage_confirmed": True,
+            "depicts_real_person": True,
+            "likeness_consent_confirmed": True,
+        },
+        size=(768, 1376),
+    )
+    submitted = submit_generation(client, shot_id, "image-to-video", asset_id)
+    assert submitted.status_code == 202
+    job_id = submitted.json()["job_id"]
+    duplicate = submit_generation(client, shot_id, "image-to-video", asset_id)
+    assert duplicate.json()["job_id"] == job_id
+
+    process_generation(job_id)
+    process_generation(job_id)
+    variant = client.get(f"/shots/{shot_id}/variants").json()[0]
+    assert provider.submit_calls == 1
+    assert variant["provenance"]["generation_mode"] == "image-to-video"
+    assert variant["provenance"]["reference_asset_id"] == asset_id
+    assert variant["provenance"]["center_crop_warning"] is True
+    with db() as conn:
+        request_data = conn.execute(
+            "SELECT request_data FROM jobs WHERE id=%s", (job_id,)
+        ).fetchone()[0]
+        checksum = conn.execute("SELECT checksum FROM assets WHERE id=%s", (asset_id,)).fetchone()[
+            0
+        ]
+        attempts = conn.execute(
+            "SELECT count(*),min(parameters->>'reference_asset_checksum') "
+            "FROM generation_attempts WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert request_data["reference_image"]["checksum"] == checksum
+    assert attempts == (1, checksum)
 
 
 def test_soft_warning_cost_and_idempotent_variant(client, db, monkeypatch, tmp_path):

@@ -10,6 +10,7 @@ dependencies = [
   "python-multipart>=0.0.9,<1",
   "pydantic-settings>=2.6,<3",
   "openai>=2.26,<3",
+  "pillow>=11,<13",
   "runwayml>=5.20,<6",
 ]
 

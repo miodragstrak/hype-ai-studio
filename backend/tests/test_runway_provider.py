@@ -6,12 +6,13 @@ import pytest
 from pydantic import SecretStr, ValidationError
 
 from backend.app.config import Settings, settings
-from backend.app.domain.models import GenerationRequest, NormalizedStatus
+from backend.app.domain.models import GenerationRequest, NormalizedStatus, ReferenceImageInput
 from backend.app.providers.factory import create_video_provider
 from backend.app.providers.mock import MockVideoProvider
 from backend.app.providers.runway import (
     AmbiguousProviderSubmissionError,
     DownloadError,
+    ReferenceUploadError,
     RunwayVideoProvider,
 )
 from backend.app.security import REDACTED, sanitize
@@ -45,10 +46,39 @@ class FakeTasks:
         self.deleted = task_id
 
 
-def make_provider(tmp_path: Path, create=None, tasks=None, http_client=None, max_bytes=1024):
+class FakeUploads:
+    def __init__(self, error=None):
+        self.error = error
+        self.calls = 0
+        self.filename = None
+
+    def create_ephemeral(self, *, file):
+        self.calls += 1
+        self.filename = file[0]
+        if self.error:
+            raise self.error
+        return SimpleNamespace(uri="runway://ephemeral/temporary-secret-uri")
+
+
+def make_provider(
+    tmp_path: Path,
+    create=None,
+    tasks=None,
+    http_client=None,
+    max_bytes=1024,
+    image_create=None,
+    uploads=None,
+):
     create = create or FakeCreate()
     tasks = tasks or FakeTasks()
-    client = SimpleNamespace(text_to_video=create, tasks=tasks)
+    image_create = image_create or FakeCreate()
+    uploads = uploads or FakeUploads()
+    client = SimpleNamespace(
+        text_to_video=create,
+        image_to_video=image_create,
+        uploads=uploads,
+        tasks=tasks,
+    )
     return (
         RunwayVideoProvider(
             tmp_path,
@@ -59,6 +89,8 @@ def make_provider(tmp_path: Path, create=None, tasks=None, http_client=None, max
         ),
         create,
         tasks,
+        image_create,
+        uploads,
     )
 
 
@@ -85,7 +117,7 @@ def test_configuration_validation_and_secret_repr():
 
 
 def test_gen45_submit_is_immediate_and_normalized(tmp_path):
-    provider, create, _ = make_provider(tmp_path)
+    provider, create, _, _, _ = make_provider(tmp_path)
     task_id = provider.submit_generation(GenerationRequest("A cinematic sunrise", "16:9", 5))
     assert task_id == "runway-task-1"
     assert create.calls == 1
@@ -96,6 +128,50 @@ def test_gen45_submit_is_immediate_and_normalized(tmp_path):
         "duration": 5,
         "output_format": "mp4",
     }
+
+
+def test_gen45_image_to_video_uses_ephemeral_upload(tmp_path):
+    image = tmp_path / "reference.jpg"
+    image.write_bytes(b"validated-image")
+    provider, text_create, _, image_create, uploads = make_provider(tmp_path)
+    task_id = provider.submit_generation(
+        GenerationRequest(
+            "Subtle performance movement",
+            "16:9",
+            5,
+            reference_asset_ids=["asset-1"],
+            reference_image=ReferenceImageInput("asset-1", "checksum-1", str(image), "image/jpeg"),
+        )
+    )
+    assert task_id == "runway-task-1"
+    assert text_create.calls == 0
+    assert uploads.calls == 1
+    assert uploads.filename == "reference.jpg"
+    assert image_create.calls == 1
+    assert image_create.arguments == {
+        "model": "gen4.5",
+        "prompt_image": [{"uri": "runway://ephemeral/temporary-secret-uri", "position": "first"}],
+        "prompt_text": "Subtle performance movement",
+        "ratio": "1280:720",
+        "duration": 5,
+        "output_format": "mp4",
+    }
+
+
+def test_ephemeral_upload_failure_does_not_create_task(tmp_path):
+    image = tmp_path / "reference.png"
+    image.write_bytes(b"validated-image")
+    uploads = FakeUploads(RuntimeError("upload failed runway://must-not-leak"))
+    provider, text_create, _, image_create, _ = make_provider(tmp_path, uploads=uploads)
+    request = GenerationRequest(
+        "Prompt",
+        "16:9",
+        5,
+        reference_image=ReferenceImageInput("asset", "checksum", str(image), "image/png"),
+    )
+    with pytest.raises(ReferenceUploadError, match="reference upload failed"):
+        provider.submit_generation(request)
+    assert text_create.calls == image_create.calls == 0
 
 
 @pytest.mark.parametrize(
@@ -110,12 +186,14 @@ def test_gen45_submit_is_immediate_and_normalized(tmp_path):
     ],
 )
 def test_status_normalization(tmp_path, provider_status, normalized):
-    provider, _, _ = make_provider(tmp_path, tasks=FakeTasks(provider_status))
+    provider, _, _, _, _ = make_provider(tmp_path, tasks=FakeTasks(provider_status))
     assert provider.get_status("task").status == normalized
 
 
 def test_ambiguous_submission_and_cancellation(tmp_path):
-    provider, _, tasks = make_provider(tmp_path, create=FakeCreate(ConnectionResetError("lost")))
+    provider, _, tasks, _, _ = make_provider(
+        tmp_path, create=FakeCreate(ConnectionResetError("lost"))
+    )
     with pytest.raises(AmbiguousProviderSubmissionError, match="manual reconciliation"):
         provider.submit_generation(GenerationRequest("Prompt", "16:9", 5))
     assert provider.cancel("task").status == NormalizedStatus.CANCELLED
@@ -145,7 +223,7 @@ class FakeHTTP:
 
 def test_successful_result_streams_to_disk(tmp_path):
     http = FakeHTTP(StreamResponse([b"video", b"-bytes"], 11))
-    provider, _, _ = make_provider(
+    provider, _, _, _, _ = make_provider(
         tmp_path, tasks=FakeTasks("SUCCEEDED"), http_client=http, max_bytes=20
     )
     result = provider.get_result("task")
@@ -156,7 +234,7 @@ def test_successful_result_streams_to_disk(tmp_path):
 
 def test_download_limit_and_partial_cleanup(tmp_path):
     http = FakeHTTP(StreamResponse([b"12345", b"67890"]))
-    provider, _, _ = make_provider(
+    provider, _, _, _, _ = make_provider(
         tmp_path, tasks=FakeTasks("SUCCEEDED"), http_client=http, max_bytes=6
     )
     with pytest.raises(DownloadError, match="size limit"):
@@ -177,9 +255,11 @@ def test_cost_estimate_and_secret_redaction():
         "message": "Bearer abc test-secret-value",
         "authorization": "Bearer abc",
         "url": "https://example.test/video?token=sensitive&ok=yes",
+        "temporary_uri": "runway://ephemeral/must-not-persist",
     }
     clean = sanitize(dirty)
     assert "test-secret-value" not in str(clean)
     assert "Bearer abc" not in str(clean)
     assert "sensitive" not in str(clean)
+    assert "must-not-persist" not in str(clean)
     assert REDACTED in str(clean)

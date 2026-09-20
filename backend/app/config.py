@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     queue_name: str = "hype:jobs"
     storage_root: Path = Path(".data/storage")
+    max_asset_upload_bytes: int = 25 * 1024 * 1024
     mock_provider_delay_seconds: float = 0.1
     mock_provider_failure_mode: str = "none"
     planning_provider: str = "mock"

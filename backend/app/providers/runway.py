@@ -41,6 +41,11 @@ class DownloadError(RuntimeError):
     code = "PROVIDER_OUTPUT_DOWNLOAD_FAILED"
 
 
+class ReferenceUploadError(RuntimeError):
+    retryable = False
+    code = "RUNWAY_REFERENCE_UPLOAD_FAILED"
+
+
 class RunwayVideoProvider:
     provider = "runway"
 
@@ -76,13 +81,34 @@ class RunwayVideoProvider:
         if ratio is None:
             raise ProviderValidationError("Runway Gen-4.5 supports 16:9 or 9:16")
         try:
-            task = self.client.text_to_video.create(
-                model=self.model,
-                prompt_text=request.prompt,
-                ratio=ratio,
-                duration=duration,
-                output_format="mp4",
-            )
+            if request.reference_image:
+                reference = request.reference_image
+                path = Path(reference.path)
+                try:
+                    with path.open("rb") as source:
+                        upload = self.client.uploads.create_ephemeral(
+                            file=(path.name, source, reference.mime_type)
+                        )
+                except Exception as exc:
+                    raise ReferenceUploadError("Runway reference upload failed") from exc
+                task = self.client.image_to_video.create(
+                    model=self.model,
+                    prompt_image=[{"uri": upload.uri, "position": "first"}],
+                    prompt_text=request.prompt,
+                    ratio=ratio,
+                    duration=duration,
+                    output_format="mp4",
+                )
+            else:
+                task = self.client.text_to_video.create(
+                    model=self.model,
+                    prompt_text=request.prompt,
+                    ratio=ratio,
+                    duration=duration,
+                    output_format="mp4",
+                )
+        except ReferenceUploadError:
+            raise
         except Exception as exc:
             raise AmbiguousProviderSubmissionError(
                 "Runway submission outcome is unknown; manual reconciliation is required"

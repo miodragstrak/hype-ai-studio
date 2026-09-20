@@ -1,3 +1,4 @@
+import hashlib
 import time
 from pathlib import Path
 
@@ -6,14 +7,22 @@ from pydantic import ValidationError
 
 from backend.app.config import settings
 from backend.app.db import connection
-from backend.app.domain.models import GenerationRequest, JobStatus, NormalizedStatus
+from backend.app.domain.models import (
+    GenerationRequest,
+    JobStatus,
+    NormalizedStatus,
+    ReferenceImageInput,
+)
 from backend.app.domain.planning import PlanningRequest, PlanningResult, validate_plan
 from backend.app.providers.factory import create_planning_provider, create_video_provider
 from backend.app.providers.openai_planning import (
     OpenAIPlanningError,
     build_planning_prompt,
 )
-from backend.app.providers.runway import AmbiguousProviderSubmissionError
+from backend.app.providers.runway import (
+    AmbiguousProviderSubmissionError,
+    ReferenceUploadError,
+)
 from backend.app.queue import dequeue, enqueue
 from backend.app.render import compose_video
 from backend.app.security import sanitize, sanitize_text
@@ -26,7 +35,8 @@ from backend.app.storage.local import LocalStorage
 def process_generation(job_id: str) -> None:
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
-            "SELECT id,project_id,shot_id,retry_count,max_retries,status FROM jobs WHERE id=%s",
+            "SELECT id,project_id,shot_id,retry_count,max_retries,status,request_data "
+            "FROM jobs WHERE id=%s",
             (job_id,),
         )
         job = cursor.fetchone()
@@ -153,6 +163,24 @@ def _fail_runway(job, attempt_id, exc: Exception, *, event_type: str | None = No
 
 def _process_runway_generation(job, shot) -> None:
     created = False
+    reference_data = (job[6] or {}).get("reference_image")
+    generation_mode = "image-to-video" if reference_data else "text-to-video"
+    parameters = {
+        "generation_mode": generation_mode,
+        "duration": settings.runway_video_duration_seconds,
+        "ratio": settings.runway_video_ratio,
+    }
+    if reference_data:
+        parameters.update(
+            {
+                "reference_asset_id": reference_data["asset_id"],
+                "reference_asset_checksum": reference_data["checksum"],
+                "reference_image_width": reference_data["width"],
+                "reference_image_height": reference_data["height"],
+                "center_crop_warning": reference_data["center_crop_warning"],
+                "derived_from_asset_id": reference_data.get("derived_from_asset_id"),
+            }
+        )
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute("SELECT status FROM jobs WHERE id=%s FOR UPDATE", (job[0],))
         current = cursor.fetchone()
@@ -170,7 +198,7 @@ def _process_runway_generation(job, shot) -> None:
                 "WHERE id=%s",
                 (job[0],),
             )
-            attempt_id, _ = reserve_attempt(cursor, job, shot)
+            attempt_id, _ = reserve_attempt(cursor, job, shot, parameters)
             if attempt_id is None:
                 error = {
                     "code": BudgetExceededError.code,
@@ -195,11 +223,31 @@ def _process_runway_generation(job, shot) -> None:
         _fail_runway(job, attempt_id, exc)
         return
 
+    reference_image = None
+    if reference_data:
+        source_path = LocalStorage(settings.storage_root).path(reference_data["storage_key"])
+        try:
+            checksum = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            _fail_runway(job, attempt_id, exc)
+            return
+        if checksum != reference_data["checksum"]:
+            _fail_runway(job, attempt_id, ValueError("Reference image checksum does not match"))
+            return
+        reference_image = ReferenceImageInput(
+            asset_id=reference_data["asset_id"],
+            checksum=reference_data["checksum"],
+            path=str(source_path),
+            mime_type=reference_data["mime_type"],
+        )
     request = GenerationRequest(
         shot[0],
         "16:9",
         float(settings.runway_video_duration_seconds),
+        reference_asset_ids=[reference_data["asset_id"]] if reference_data else [],
+        reference_image=reference_image,
         correlation_id=str(job[0]),
+        parameters=parameters,
     )
     if provider_id is None:
         if not created:
@@ -217,14 +265,22 @@ def _process_runway_generation(job, shot) -> None:
         try:
             provider_id = provider.submit_generation(request)
         except Exception as exc:  # noqa: BLE001 - submission ambiguity is the safety boundary
-            ambiguous = (
-                exc
-                if isinstance(exc, AmbiguousProviderSubmissionError)
-                else AmbiguousProviderSubmissionError(
-                    "Runway submission outcome is unknown; manual reconciliation is required"
+            if isinstance(exc, ReferenceUploadError):
+                _fail_runway(job, attempt_id, exc, event_type="REFERENCE_UPLOAD_FAILED")
+            else:
+                ambiguous = (
+                    exc
+                    if isinstance(exc, AmbiguousProviderSubmissionError)
+                    else AmbiguousProviderSubmissionError(
+                        "Runway submission outcome is unknown; manual reconciliation is required"
+                    )
                 )
-            )
-            _fail_runway(job, attempt_id, ambiguous, event_type="AMBIGUOUS_PROVIDER_SUBMISSION")
+                _fail_runway(
+                    job,
+                    attempt_id,
+                    ambiguous,
+                    event_type="AMBIGUOUS_PROVIDER_SUBMISSION",
+                )
             return
         with connection() as conn, conn.cursor() as cursor:
             cursor.execute(
@@ -290,13 +346,53 @@ def _process_runway_generation(job, shot) -> None:
                 cursor.execute(
                     "INSERT INTO events(project_id,event_type,actor_type,entity_type,entity_id,payload) "
                     "VALUES (%s,'VARIANT_CREATED','worker','shot_variant',%s,%s)",
-                    (job[1], variant_id, Jsonb({"job_id": str(job[0])})),
+                    (
+                        job[1],
+                        variant_id,
+                        Jsonb(
+                            {
+                                "job_id": str(job[0]),
+                                "generation_mode": generation_mode,
+                                "reference_asset_id": (
+                                    reference_data["asset_id"] if reference_data else None
+                                ),
+                                "reference_asset_checksum": (
+                                    reference_data["checksum"] if reference_data else None
+                                ),
+                                "derived_from_asset_id": (
+                                    reference_data.get("derived_from_asset_id")
+                                    if reference_data
+                                    else None
+                                ),
+                            }
+                        ),
+                    ),
                 )
             cursor.execute(
                 "UPDATE generation_attempts SET status='SUCCEEDED',completed_at=now(),duration=%s,provider_metadata=%s WHERE id=%s",
                 (
                     settings.runway_video_duration_seconds,
-                    Jsonb(sanitize(result.provider_metadata)),
+                    Jsonb(
+                        sanitize(
+                            {
+                                **result.provider_metadata,
+                                "generation_mode": generation_mode,
+                                "duration": settings.runway_video_duration_seconds,
+                                "ratio": settings.runway_video_ratio,
+                                "reference_asset_id": (
+                                    reference_data["asset_id"] if reference_data else None
+                                ),
+                                "reference_asset_checksum": (
+                                    reference_data["checksum"] if reference_data else None
+                                ),
+                                "derived_from_asset_id": (
+                                    reference_data.get("derived_from_asset_id")
+                                    if reference_data
+                                    else None
+                                ),
+                            }
+                        )
+                    ),
                     attempt_id,
                 ),
             )
