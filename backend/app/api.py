@@ -107,6 +107,7 @@ class PlanDetail(PlanningResult):
     created_at: datetime
     approved_at: datetime | None
     materialized_at: datetime | None
+    provider_evidence: dict[str, Any] | None = None
 
 
 def record_event(cursor, project_id, event_type, entity_type, entity_id, payload=None):
@@ -510,14 +511,27 @@ def get_variant_media(variant_id: UUID, download: bool = Query(False)):
     return media_response(row[0], row[1], download)
 
 
-def _plan_detail(row) -> dict:
+def _plan_detail(row, provider_evidence=None) -> dict:
     return {
-        "id": str(row[0]), "project_id": str(row[1]), "version": row[2], "status": row[3],
-        "parent_plan_id": str(row[4]) if row[4] else None, "planning_inputs": row[5],
-        "schema_version": row[11], "concept_title": row[6], "logline": row[7],
-        "treatment": row[8], "creative_direction": row[9], "shots": row[10],
-        "provider": row[12], "model": row[13], "source_job_id": str(row[14]) if row[14] else None,
-        "created_at": row[15], "approved_at": row[16], "materialized_at": row[17],
+        "id": str(row[0]),
+        "project_id": str(row[1]),
+        "version": row[2],
+        "status": row[3],
+        "parent_plan_id": str(row[4]) if row[4] else None,
+        "planning_inputs": row[5],
+        "schema_version": row[11],
+        "concept_title": row[6],
+        "logline": row[7],
+        "treatment": row[8],
+        "creative_direction": row[9],
+        "shots": row[10],
+        "provider": row[12],
+        "model": row[13],
+        "source_job_id": str(row[14]) if row[14] else None,
+        "created_at": row[15],
+        "approved_at": row[16],
+        "materialized_at": row[17],
+        "provider_evidence": provider_evidence,
     }
 
 
@@ -527,13 +541,11 @@ _PLAN_COLUMNS = (
 )
 
 
-@app.post(
-    "/projects/{project_id}/plans/generate", status_code=202, response_model=PlanJobResponse
-)
+@app.post("/projects/{project_id}/plans/generate", status_code=202, response_model=PlanJobResponse)
 def generate_plan(project_id: UUID, body: PlanGenerate):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
-            "SELECT creative_brief,aspect_ratio FROM projects WHERE id=%s AND project_type='MUSIC_VIDEO'",
+            "SELECT creative_brief,aspect_ratio,title FROM projects WHERE id=%s AND project_type='MUSIC_VIDEO'",
             (project_id,),
         )
         project = cursor.fetchone()
@@ -546,17 +558,31 @@ def generate_plan(project_id: UUID, body: PlanGenerate):
                 (project_id,),
             )
             assets = [
-                {"id": str(row[0]), "asset_type": row[1], "mime_type": row[2], "size_bytes": row[3], "rights_metadata": row[4]}
+                {
+                    "id": str(row[0]),
+                    "asset_type": row[1],
+                    "mime_type": row[2],
+                    "size_bytes": row[3],
+                    "rights_metadata": row[4],
+                }
                 for row in cursor.fetchall()
             ]
         request = PlanningRequest(
-            project_id=str(project_id), creative_brief=project[0],
-            target_duration_seconds=body.target_duration_seconds, aspect_ratio=project[1],
-            visual_tone=body.visual_tone, narrative_approach=body.narrative_approach,
-            performance_presence=body.performance_presence, pacing=body.pacing,
-            constraints=body.constraints, reference_assets=assets,
+            project_id=str(project_id),
+            project_type="MUSIC_VIDEO",
+            project_title=project[2],
+            creative_brief=project[0],
+            target_duration_seconds=body.target_duration_seconds,
+            aspect_ratio=project[1],
+            visual_tone=body.visual_tone,
+            narrative_approach=body.narrative_approach,
+            performance_presence=body.performance_presence,
+            pacing=body.pacing,
+            constraints=body.constraints,
+            reference_assets=assets,
             maximum_shot_count=min(body.maximum_shot_count, settings.planning_max_shot_count),
-            correlation_id=body.idempotency_key, idempotency_key=body.idempotency_key,
+            correlation_id=body.idempotency_key,
+            idempotency_key=body.idempotency_key,
         )
         cursor.execute(
             "INSERT INTO jobs(project_id,job_type,status,idempotency_key,max_retries,request_data) "
@@ -565,7 +591,10 @@ def generate_plan(project_id: UUID, body: PlanGenerate):
         )
         created = cursor.fetchone()
         if created is None:
-            cursor.execute("SELECT id,status,project_id,job_type FROM jobs WHERE idempotency_key=%s", (body.idempotency_key,))
+            cursor.execute(
+                "SELECT id,status,project_id,job_type FROM jobs WHERE idempotency_key=%s",
+                (body.idempotency_key,),
+            )
             existing = cursor.fetchone()
             if existing[2] != project_id or existing[3] != "PLAN_GENERATION":
                 raise HTTPException(409, "idempotency key belongs to another request")
@@ -580,22 +609,56 @@ def generate_plan(project_id: UUID, body: PlanGenerate):
 @app.get("/projects/{project_id}/plans", response_model=list[PlanSummary])
 def list_plans(project_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
-        cursor.execute("SELECT 1 FROM projects WHERE id=%s AND project_type='MUSIC_VIDEO'", (project_id,))
+        cursor.execute(
+            "SELECT 1 FROM projects WHERE id=%s AND project_type='MUSIC_VIDEO'", (project_id,)
+        )
         if cursor.fetchone() is None:
             raise HTTPException(404, "music video project not found")
-        cursor.execute("SELECT id,version,status,concept_title,provider,model,created_at,approved_at FROM project_plans WHERE project_id=%s ORDER BY version DESC", (project_id,))
+        cursor.execute(
+            "SELECT id,version,status,concept_title,provider,model,created_at,approved_at FROM project_plans WHERE project_id=%s ORDER BY version DESC",
+            (project_id,),
+        )
         rows = cursor.fetchall()
-    return [dict(zip(("id","version","status","concept_title","provider","model","created_at","approved_at"), row)) for row in rows]
+    return [
+        dict(
+            zip(
+                (
+                    "id",
+                    "version",
+                    "status",
+                    "concept_title",
+                    "provider",
+                    "model",
+                    "created_at",
+                    "approved_at",
+                ),
+                row,
+            )
+        )
+        for row in rows
+    ]
 
 
 @app.get("/projects/{project_id}/plans/{plan_id}", response_model=PlanDetail)
 def get_plan(project_id: UUID, plan_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
-        cursor.execute(f"SELECT {_PLAN_COLUMNS} FROM project_plans WHERE id=%s AND project_id=%s", (plan_id, project_id))
+        cursor.execute(
+            f"SELECT {_PLAN_COLUMNS} FROM project_plans WHERE id=%s AND project_id=%s",
+            (plan_id, project_id),
+        )
         row = cursor.fetchone()
+        evidence = None
+        if row and row[14]:
+            cursor.execute(
+                "SELECT payload->'evidence' FROM events WHERE entity_id=%s "
+                "AND event_type='OPENAI_PLANNING_RESPONSE' ORDER BY created_at DESC LIMIT 1",
+                (row[14],),
+            )
+            evidence_row = cursor.fetchone()
+            evidence = evidence_row[0] if evidence_row else None
     if row is None:
         raise HTTPException(404, "plan not found")
-    return _plan_detail(row)
+    return _plan_detail(row, evidence)
 
 
 @app.post(
@@ -603,7 +666,10 @@ def get_plan(project_id: UUID, plan_id: UUID):
 )
 def create_plan_version(project_id: UUID, plan_id: UUID, body: PlanVersionCreate):
     with connection() as conn, conn.cursor() as cursor:
-        cursor.execute(f"SELECT {_PLAN_COLUMNS} FROM project_plans WHERE id=%s AND project_id=%s", (plan_id, project_id))
+        cursor.execute(
+            f"SELECT {_PLAN_COLUMNS} FROM project_plans WHERE id=%s AND project_id=%s",
+            (plan_id, project_id),
+        )
         parent = cursor.fetchone()
         if parent is None:
             raise HTTPException(404, "plan not found")
@@ -611,18 +677,44 @@ def create_plan_version(project_id: UUID, plan_id: UUID, body: PlanVersionCreate
         cursor.execute("SELECT id FROM assets WHERE project_id=%s", (project_id,))
         allowed = {str(row[0]) for row in cursor.fetchall()}
         try:
-            validate_plan(body, target_duration=float(inputs["target_duration_seconds"]), maximum_shots=int(inputs["maximum_shot_count"]), allowed_asset_ids=allowed)
+            validate_plan(
+                body,
+                target_duration=float(inputs["target_duration_seconds"]),
+                maximum_shots=int(inputs["maximum_shot_count"]),
+                allowed_asset_ids=allowed,
+            )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         cursor.execute("SELECT id FROM projects WHERE id=%s FOR UPDATE", (project_id,))
-        cursor.execute("SELECT COALESCE(max(version),0)+1 FROM project_plans WHERE project_id=%s", (project_id,))
+        cursor.execute(
+            "SELECT COALESCE(max(version),0)+1 FROM project_plans WHERE project_id=%s",
+            (project_id,),
+        )
         version = cursor.fetchone()[0]
         cursor.execute(
             "INSERT INTO project_plans(project_id,version,parent_plan_id,planning_inputs,concept_title,logline,treatment,creative_direction,shot_plan,provider,model,prompt_schema_version) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'producer','manual-edit',%s) RETURNING id",
-            (project_id,version,plan_id,Jsonb(inputs),body.concept_title,body.logline,body.treatment,Jsonb(body.creative_direction.model_dump()),Jsonb([shot.model_dump() for shot in body.shots]),body.schema_version),
+            (
+                project_id,
+                version,
+                plan_id,
+                Jsonb(inputs),
+                body.concept_title,
+                body.logline,
+                body.treatment,
+                Jsonb(body.creative_direction.model_dump()),
+                Jsonb([shot.model_dump() for shot in body.shots]),
+                body.schema_version,
+            ),
         )
         new_id = cursor.fetchone()[0]
-        record_event(cursor, project_id, "PLAN_VERSION_CREATED", "project_plan", new_id, {"parent_plan_id": str(plan_id), "version": version})
+        record_event(
+            cursor,
+            project_id,
+            "PLAN_VERSION_CREATED",
+            "project_plan",
+            new_id,
+            {"parent_plan_id": str(plan_id), "version": version},
+        )
         conn.commit()
     return get_plan(project_id, new_id)
 
@@ -630,7 +722,10 @@ def create_plan_version(project_id: UUID, plan_id: UUID, body: PlanVersionCreate
 @app.post("/projects/{project_id}/plans/{plan_id}/approve", response_model=PlanApprovalResponse)
 def approve_plan(project_id: UUID, plan_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
-        cursor.execute(f"SELECT {_PLAN_COLUMNS} FROM project_plans WHERE id=%s AND project_id=%s FOR UPDATE", (plan_id, project_id))
+        cursor.execute(
+            f"SELECT {_PLAN_COLUMNS} FROM project_plans WHERE id=%s AND project_id=%s FOR UPDATE",
+            (plan_id, project_id),
+        )
         row = cursor.fetchone()
         if row is None:
             raise HTTPException(404, "plan not found")
@@ -654,20 +749,35 @@ def approve_plan(project_id: UUID, plan_id: UUID):
         cursor.execute("SELECT id FROM assets WHERE project_id=%s", (project_id,))
         allowed = {str(item[0]) for item in cursor.fetchall()}
         try:
-            validate_plan(result,target_duration=float(detail["planning_inputs"]["target_duration_seconds"]),maximum_shots=int(detail["planning_inputs"]["maximum_shot_count"]),allowed_asset_ids=allowed)
+            validate_plan(
+                result,
+                target_duration=float(detail["planning_inputs"]["target_duration_seconds"]),
+                maximum_shots=int(detail["planning_inputs"]["maximum_shot_count"]),
+                allowed_asset_ids=allowed,
+            )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         cursor.execute("SELECT id FROM shots WHERE source_plan_id=%s ORDER BY ordinal", (plan_id,))
         existing = [item[0] for item in cursor.fetchall()]
         if row[3] == "APPROVED" and row[17] is not None:
             conn.commit()
-            return PlanApprovalResponse(plan_id=plan_id,status="APPROVED",created_shot_ids=existing,idempotent=True)
-        cursor.execute("SELECT id FROM project_plans WHERE project_id=%s AND status='APPROVED' AND id<>%s FOR UPDATE", (project_id,plan_id))
+            return PlanApprovalResponse(
+                plan_id=plan_id, status="APPROVED", created_shot_ids=existing, idempotent=True
+            )
+        cursor.execute(
+            "SELECT id FROM project_plans WHERE project_id=%s AND status='APPROVED' AND id<>%s FOR UPDATE",
+            (project_id, plan_id),
+        )
         prior = cursor.fetchone()
         if prior:
-            cursor.execute("SELECT count(*) FROM generation_attempts ga JOIN shots s ON s.id=ga.shot_id WHERE s.source_plan_id=%s", (prior[0],))
+            cursor.execute(
+                "SELECT count(*) FROM generation_attempts ga JOIN shots s ON s.id=ga.shot_id WHERE s.source_plan_id=%s",
+                (prior[0],),
+            )
             if cursor.fetchone()[0]:
-                raise HTTPException(409, "approved plan cannot be replaced after generation has started")
+                raise HTTPException(
+                    409, "approved plan cannot be replaced after generation has started"
+                )
             cursor.execute(
                 "SELECT s.source_plan_item_key,s.title,s.prompt,s.intended_duration,p.shot_plan "
                 "FROM shots s JOIN project_plans p ON p.id=s.source_plan_id "
@@ -684,25 +794,60 @@ def approve_plan(project_id: UUID, plan_id: UUID):
                 for item_key, title, prompt, duration, _shot_plan in prior_rows
             )
             if changed:
-                raise HTTPException(409, "approved plan cannot be replaced after its shots were changed")
+                raise HTTPException(
+                    409, "approved plan cannot be replaced after its shots were changed"
+                )
             cursor.execute("DELETE FROM shots WHERE source_plan_id=%s", (prior[0],))
             cursor.execute("UPDATE project_plans SET status='SUPERSEDED' WHERE id=%s", (prior[0],))
-            record_event(cursor,project_id,"PLAN_SUPERSEDED","project_plan",prior[0],{"replacement_plan_id":str(plan_id)})
-        cursor.execute("SELECT COALESCE(max(ordinal),0) FROM shots WHERE project_id=%s AND source_plan_id IS NULL", (project_id,))
+            record_event(
+                cursor,
+                project_id,
+                "PLAN_SUPERSEDED",
+                "project_plan",
+                prior[0],
+                {"replacement_plan_id": str(plan_id)},
+            )
+        cursor.execute(
+            "SELECT COALESCE(max(ordinal),0) FROM shots WHERE project_id=%s AND source_plan_id IS NULL",
+            (project_id,),
+        )
         offset = cursor.fetchone()[0]
         created = []
         for shot in result.shots:
             cursor.execute(
                 "INSERT INTO shots(project_id,ordinal,title,prompt,intended_duration,status,source_plan_id,source_plan_item_key) VALUES (%s,%s,%s,%s,%s,'PLANNED',%s,%s) ON CONFLICT (source_plan_id,source_plan_item_key) WHERE source_plan_id IS NOT NULL DO NOTHING RETURNING id",
-                (project_id,offset+shot.ordinal,shot.title,shot.prompt,shot.duration_seconds,plan_id,shot.item_key),
+                (
+                    project_id,
+                    offset + shot.ordinal,
+                    shot.title,
+                    shot.prompt,
+                    shot.duration_seconds,
+                    plan_id,
+                    shot.item_key,
+                ),
             )
             inserted = cursor.fetchone()
-            if inserted: created.append(inserted[0])
-        cursor.execute("UPDATE project_plans SET status='APPROVED',approved_at=now(),materialized_at=now() WHERE id=%s", (plan_id,))
-        record_event(cursor,project_id,"PLAN_APPROVED","project_plan",plan_id,{"version":row[2]})
-        record_event(cursor,project_id,"PLAN_SHOTS_MATERIALIZED","project_plan",plan_id,{"shot_ids":[str(value) for value in created]})
+            if inserted:
+                created.append(inserted[0])
+        cursor.execute(
+            "UPDATE project_plans SET status='APPROVED',approved_at=now(),materialized_at=now() WHERE id=%s",
+            (plan_id,),
+        )
+        record_event(
+            cursor, project_id, "PLAN_APPROVED", "project_plan", plan_id, {"version": row[2]}
+        )
+        record_event(
+            cursor,
+            project_id,
+            "PLAN_SHOTS_MATERIALIZED",
+            "project_plan",
+            plan_id,
+            {"shot_ids": [str(value) for value in created]},
+        )
         conn.commit()
-    return PlanApprovalResponse(plan_id=plan_id,status="APPROVED",created_shot_ids=created,idempotent=False)
+    return PlanApprovalResponse(
+        plan_id=plan_id, status="APPROVED", created_shot_ids=created, idempotent=False
+    )
 
 
 @app.get("/projects/{project_id}/events")

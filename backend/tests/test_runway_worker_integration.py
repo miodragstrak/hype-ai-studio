@@ -97,7 +97,9 @@ def test_soft_warning_cost_and_idempotent_variant(client, db, monkeypatch, tmp_p
         ).fetchone()[0]
         events = {
             row[0]
-            for row in conn.execute("SELECT event_type FROM events WHERE project_id=%s", (project_id,))
+            for row in conn.execute(
+                "SELECT event_type FROM events WHERE project_id=%s", (project_id,)
+            )
         }
     assert provider.submit_calls == 1
     assert attempt[0].startswith("task-")
@@ -126,7 +128,9 @@ def test_hard_limit_rejects_before_provider_call(client, db, monkeypatch, tmp_pa
     job_id = submit_generation(client, shot_id, "runway-hard").json()["job_id"]
     process_generation(job_id)
     assert called is False
-    assert client.get(f"/jobs/{job_id}").json()["error_data"]["code"] == "RUNWAY_HARD_LIMIT_EXCEEDED"
+    assert (
+        client.get(f"/jobs/{job_id}").json()["error_data"]["code"] == "RUNWAY_HARD_LIMIT_EXCEEDED"
+    )
     events = client.get(f"/projects/{project_id}/events").json()
     assert any(event["event_type"] == "RUNWAY_HARD_LIMIT_REJECTED" for event in events)
 
@@ -210,9 +214,7 @@ def test_polling_failure_with_known_id_never_resubmits(client, db, monkeypatch, 
     assert client.get(f"/jobs/{job_id}").json()["status"] == "FAILED"
 
 
-def test_reserved_redelivery_and_ambiguous_error_are_sanitized(
-    client, db, monkeypatch, tmp_path
-):
+def test_reserved_redelivery_and_ambiguous_error_are_sanitized(client, db, monkeypatch, tmp_path):
     output = runway_settings(tmp_path)
     provider = FakeRunwayProvider(output)
     monkeypatch.setattr("backend.app.worker.create_video_provider", lambda *_: provider)

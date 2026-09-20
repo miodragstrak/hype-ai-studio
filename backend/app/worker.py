@@ -7,13 +7,18 @@ from pydantic import ValidationError
 from backend.app.config import settings
 from backend.app.db import connection
 from backend.app.domain.models import GenerationRequest, JobStatus, NormalizedStatus
-from backend.app.domain.planning import PlanningRequest, validate_plan
+from backend.app.domain.planning import PlanningRequest, PlanningResult, validate_plan
 from backend.app.providers.factory import create_planning_provider, create_video_provider
+from backend.app.providers.openai_planning import (
+    OpenAIPlanningError,
+    build_planning_prompt,
+)
 from backend.app.providers.runway import AmbiguousProviderSubmissionError
 from backend.app.queue import dequeue, enqueue
 from backend.app.render import compose_video
 from backend.app.security import sanitize, sanitize_text
 from backend.app.services.jobs import transition
+from backend.app.services.planning_budget import reconcile_budget, reserve_budget
 from backend.app.services.runway_budget import BudgetExceededError, reserve_attempt
 from backend.app.storage.local import LocalStorage
 
@@ -249,7 +254,8 @@ def _process_runway_generation(job, shot) -> None:
 
         with connection() as conn, conn.cursor() as cursor:
             cursor.execute(
-                "SELECT storage_key FROM shot_variants WHERE generation_attempt_id=%s", (attempt_id,)
+                "SELECT storage_key FROM shot_variants WHERE generation_attempt_id=%s",
+                (attempt_id,),
             )
             if cursor.fetchone() is not None:
                 cursor.execute(
@@ -259,7 +265,9 @@ def _process_runway_generation(job, shot) -> None:
                 conn.commit()
                 return
         with connection() as conn, conn.cursor() as cursor:
-            cursor.execute("UPDATE jobs SET status='DOWNLOADING',updated_at=now() WHERE id=%s", (job[0],))
+            cursor.execute(
+                "UPDATE jobs SET status='DOWNLOADING',updated_at=now() WHERE id=%s", (job[0],)
+            )
             conn.commit()
         result = provider.get_result(provider_id)
         if result.status != NormalizedStatus.SUCCEEDED or not result.outputs:
@@ -267,7 +275,10 @@ def _process_runway_generation(job, shot) -> None:
         key = f"projects/{job[1]}/variants/{job[0]}.mp4"
         LocalStorage(settings.storage_root).save_file(key, Path(result.outputs[0].uri))
         with connection() as conn, conn.cursor() as cursor:
-            cursor.execute("SELECT id FROM shot_variants WHERE generation_attempt_id=%s FOR UPDATE", (attempt_id,))
+            cursor.execute(
+                "SELECT id FROM shot_variants WHERE generation_attempt_id=%s FOR UPDATE",
+                (attempt_id,),
+            )
             variant = cursor.fetchone()
             if variant is None:
                 cursor.execute(
@@ -283,7 +294,11 @@ def _process_runway_generation(job, shot) -> None:
                 )
             cursor.execute(
                 "UPDATE generation_attempts SET status='SUCCEEDED',completed_at=now(),duration=%s,provider_metadata=%s WHERE id=%s",
-                (settings.runway_video_duration_seconds, Jsonb(sanitize(result.provider_metadata)), attempt_id),
+                (
+                    settings.runway_video_duration_seconds,
+                    Jsonb(sanitize(result.provider_metadata)),
+                    attempt_id,
+                ),
             )
             cursor.execute(
                 "UPDATE jobs SET status='SUCCEEDED',completed_at=now(),error_data=NULL,updated_at=now() WHERE id=%s",
@@ -330,6 +345,17 @@ def process_render(render_id: str) -> None:
 
 
 def process_planning(job_id: str) -> None:
+    with connection() as lock_conn, lock_conn.cursor() as lock_cursor:
+        lock_cursor.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (f"planning:{job_id}",))
+        if not lock_cursor.fetchone()[0]:
+            return
+        try:
+            _process_planning(job_id)
+        finally:
+            lock_cursor.execute("SELECT pg_advisory_unlock(hashtext(%s))", (f"planning:{job_id}",))
+
+
+def _process_planning(job_id: str) -> None:
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
             "SELECT id,project_id,retry_count,max_retries,status,request_data FROM jobs WHERE id=%s",
@@ -340,28 +366,63 @@ def process_planning(job_id: str) -> None:
             return
         cursor.execute("SELECT 1 FROM project_plans WHERE source_job_id=%s", (job[0],))
         if cursor.fetchone():
-            cursor.execute("UPDATE jobs SET status='SUCCEEDED',completed_at=COALESCE(completed_at,now()) WHERE id=%s", (job[0],))
+            cursor.execute(
+                "UPDATE jobs SET status='SUCCEEDED',completed_at=COALESCE(completed_at,now()) WHERE id=%s",
+                (job[0],),
+            )
             conn.commit()
             return
+        cursor.execute(
+            "SELECT payload FROM events WHERE entity_id=%s "
+            "AND event_type='OPENAI_PLANNING_RESPONSE' ORDER BY created_at DESC LIMIT 1",
+            (job[0],),
+        )
+        persisted_response = cursor.fetchone()
     failure_mode = settings.mock_planning_failure_mode
     if failure_mode.startswith("transient:"):
         failures = int(failure_mode.partition(":")[2])
         failure_mode = "transient" if job[2] < failures else "none"
-    provider = create_planning_provider(failure_mode)
     try:
-        transition(job[0], JobStatus.SUBMITTING)
         request = PlanningRequest.model_validate(job[5])
-        provider_id = provider.submit_plan(request)
-        transition(job[0], JobStatus.PROVIDER_PENDING)
-        transition(job[0], JobStatus.PROCESSING)
-        while provider.get_status(provider_id).status == NormalizedStatus.PENDING:
-            time.sleep(0.01)
-        status = provider.get_status(provider_id)
-        if status.status != NormalizedStatus.SUCCEEDED:
-            exception = RuntimeError(status.error.message if status.error else "planning failed")
-            exception.retryable = bool(status.error and status.error.retryable)  # type: ignore[attr-defined]
-            raise exception
-        result = provider.get_result(provider_id)
+        provider = create_planning_provider(failure_mode)
+        evidence = None
+        if settings.planning_provider == "openai" and persisted_response:
+            evidence = persisted_response[0]["evidence"]
+            result = PlanningResult.model_validate(persisted_response[0]["result"])
+        else:
+            if settings.planning_provider == "openai" and job[4] in {
+                "SUBMITTING",
+                "PROVIDER_PENDING",
+                "PROCESSING",
+            }:
+                raise OpenAIPlanningError(
+                    "OPENAI_REDELIVERY_RECONCILIATION_REQUIRED",
+                    "OpenAI submission has no persisted response; manual reconciliation is required",
+                    ambiguous=True,
+                )
+            reserved = None
+            if settings.planning_provider == "openai":
+                with connection() as conn, conn.cursor() as cursor:
+                    reserved = reserve_budget(
+                        cursor, job[1], job[0], build_planning_prompt(request)
+                    )
+                    conn.commit()
+            transition(job[0], JobStatus.SUBMITTING)
+            provider_id = provider.submit_plan(request)
+            transition(job[0], JobStatus.PROVIDER_PENDING)
+            transition(job[0], JobStatus.PROCESSING)
+            while provider.get_status(provider_id).status == NormalizedStatus.PENDING:
+                time.sleep(0.01)
+            status = provider.get_status(provider_id)
+            if status.status != NormalizedStatus.SUCCEEDED:
+                exception = RuntimeError(
+                    status.error.message if status.error else "planning failed"
+                )
+                exception.retryable = bool(status.error and status.error.retryable)  # type: ignore[attr-defined]
+                raise exception
+            result = provider.get_result(provider_id)
+            if settings.planning_provider == "openai":
+                evidence = provider.get_evidence(provider_id)  # type: ignore[attr-defined]
         allowed_assets = {str(asset["id"]) for asset in request.reference_assets}
         validate_plan(
             result,
@@ -369,31 +430,79 @@ def process_planning(job_id: str) -> None:
             maximum_shots=request.maximum_shot_count,
             allowed_asset_ids=allowed_assets,
         )
+        if settings.planning_provider == "openai" and not persisted_response:
+            assert evidence is not None and reserved is not None
+            with connection() as conn, conn.cursor() as cursor:
+                cost = reconcile_budget(cursor, job[1], job[0], reserved, evidence["usage"])
+                evidence = {**evidence, "cost": cost}
+                cursor.execute(
+                    "INSERT INTO events(project_id,event_type,actor_type,entity_type,entity_id,payload) "
+                    "VALUES (%s,'OPENAI_PLANNING_RESPONSE','worker','job',%s,%s)",
+                    (
+                        job[1],
+                        job[0],
+                        Jsonb({"evidence": sanitize(evidence), "result": result.model_dump()}),
+                    ),
+                )
+                conn.commit()
         with connection() as conn, conn.cursor() as cursor:
             cursor.execute("SELECT id FROM projects WHERE id=%s FOR UPDATE", (job[1],))
-            cursor.execute("SELECT COALESCE(max(version),0)+1 FROM project_plans WHERE project_id=%s", (job[1],))
+            cursor.execute(
+                "SELECT COALESCE(max(version),0)+1 FROM project_plans WHERE project_id=%s",
+                (job[1],),
+            )
             version = cursor.fetchone()[0]
             cursor.execute(
                 "INSERT INTO project_plans(project_id,version,planning_inputs,concept_title,logline,treatment,creative_direction,shot_plan,provider,model,prompt_schema_version,source_job_id) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (source_job_id) DO NOTHING RETURNING id",
                 (
-                    job[1], version, Jsonb(request.model_dump()), result.concept_title,
-                    result.logline, result.treatment, Jsonb(result.creative_direction.model_dump()),
-                    Jsonb([shot.model_dump() for shot in result.shots]), provider.provider,
-                    provider.model, result.schema_version, job[0],
+                    job[1],
+                    version,
+                    Jsonb(request.model_dump()),
+                    result.concept_title,
+                    result.logline,
+                    result.treatment,
+                    Jsonb(result.creative_direction.model_dump()),
+                    Jsonb([shot.model_dump() for shot in result.shots]),
+                    settings.planning_provider,
+                    evidence["model"] if evidence else provider.model,
+                    result.schema_version,
+                    job[0],
                 ),
             )
             plan = cursor.fetchone()
             if plan:
                 cursor.execute(
                     "INSERT INTO events(project_id,event_type,actor_type,entity_type,entity_id,payload) VALUES (%s,'PLAN_GENERATED','worker','project_plan',%s,%s)",
-                    (job[1], plan[0], Jsonb({"version": version, "job_id": str(job[0])})),
+                    (
+                        job[1],
+                        plan[0],
+                        Jsonb(
+                            sanitize(
+                                {
+                                    "version": version,
+                                    "job_id": str(job[0]),
+                                    "provider_evidence": evidence,
+                                }
+                            )
+                        ),
+                    ),
                 )
             conn.commit()
         transition(job[0], JobStatus.SUCCEEDED)
     except Exception as exc:  # noqa: BLE001 - normalized into persisted job error
-        retryable = bool(getattr(exc, "retryable", not isinstance(exc, (ValidationError, ValueError))))
-        error = {"message": str(exc), "retryable": retryable, "type": type(exc).__name__}
+        retryable = bool(
+            getattr(exc, "retryable", not isinstance(exc, (ValidationError, ValueError)))
+        )
+        error = sanitize(
+            {
+                "code": getattr(exc, "code", type(exc).__name__),
+                "message": sanitize_text(exc),
+                "retryable": retryable,
+                "ambiguous": bool(getattr(exc, "ambiguous", False)),
+                "type": type(exc).__name__,
+            }
+        )
         if retryable and job[2] < job[3]:
             with connection() as conn, conn.cursor() as cursor:
                 cursor.execute("UPDATE jobs SET retry_count=retry_count+1 WHERE id=%s", (job[0],))

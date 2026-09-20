@@ -1,5 +1,6 @@
 .venv/
 .env
+.env.example
 .data/
 test-artifacts/
 __pycache__/
