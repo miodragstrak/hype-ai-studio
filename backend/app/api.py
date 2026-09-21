@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
 from psycopg.types.json import Jsonb
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from backend.app.config import settings
 from backend.app.db import connection
@@ -53,10 +53,37 @@ class ShotOrder(BaseModel):
     shot_ids: list[UUID] = Field(min_length=1)
 
 
+class IntroCard(BaseModel):
+    artist_name: str = Field(min_length=1, max_length=100)
+    song_title: str = Field(min_length=1, max_length=150)
+    duration_seconds: float = Field(ge=1, le=10, allow_inf_nan=False)
+
+    @field_validator("artist_name", "song_title")
+    @classmethod
+    def card_text_required(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("card text must not be blank")
+        return value
+
+
+class OutroCard(BaseModel):
+    text: str = Field(min_length=1, max_length=200)
+    duration_seconds: float = Field(ge=1, le=10, allow_inf_nan=False)
+
+    @field_validator("text")
+    @classmethod
+    def card_text_required(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("card text must not be blank")
+        return value
+
+
 class RenderCreate(BaseModel):
     variant_ids: list[UUID] = Field(min_length=1)
     audio_asset_id: UUID
     audio_start_seconds: float = Field(default=0, ge=0, allow_inf_nan=False)
+    intro_card: IntroCard | None = None
+    outro_card: OutroCard | None = None
 
 
 class PlanGenerate(BaseModel):
@@ -975,7 +1002,11 @@ def create_render(project_id: UUID, body: RenderCreate):
             raise HTTPException(404, "one or more variants not found")
         keys = {str(row[0]): row[1] for row in variants}
         durations = {str(row[0]): float(row[2]) for row in variants}
-        expected_duration = sum(durations[str(value)] for value in body.variant_ids)
+        shot_duration = sum(durations[str(value)] for value in body.variant_ids)
+        card_duration = sum(
+            card.duration_seconds for card in (body.intro_card, body.outro_card) if card
+        )
+        expected_duration = shot_duration + card_duration
         audio_path = LocalStorage(settings.storage_root).path(audio[0])
         try:
             audio_duration = probe_duration(audio_path)
@@ -994,6 +1025,10 @@ def create_render(project_id: UUID, body: RenderCreate):
             "audio_key": audio[0],
             "variant_keys": [keys[str(value)] for value in body.variant_ids],
             "audio_start_seconds": body.audio_start_seconds,
+            "intro_card": body.intro_card.model_dump() if body.intro_card else None,
+            "outro_card": body.outro_card.model_dump() if body.outro_card else None,
+            "shot_duration": shot_duration,
+            "card_duration": card_duration,
             "expected_duration": expected_duration,
             "audio_duration": audio_duration,
         }

@@ -425,6 +425,8 @@ def process_render(render_id: str) -> None:
             storage.path(spec["audio_key"]),
             storage.path(output_key),
             float(spec.get("audio_start_seconds", 0)),
+            spec.get("intro_card"),
+            spec.get("outro_card"),
         )
         with connection() as conn, conn.cursor() as cursor:
             cursor.execute(
