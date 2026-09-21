@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import math
 from datetime import datetime
 from pathlib import PurePath
 from typing import Any
@@ -18,6 +19,7 @@ from backend.app.db import connection
 from backend.app.domain.models import JobStatus
 from backend.app.domain.planning import PlanningRequest, PlanningResult, validate_plan
 from backend.app.queue import enqueue
+from backend.app.render import probe_duration
 from backend.app.storage.local import LocalStorage
 
 app = FastAPI(title="Hype AI Studio")
@@ -54,6 +56,7 @@ class ShotOrder(BaseModel):
 class RenderCreate(BaseModel):
     variant_ids: list[UUID] = Field(min_length=1)
     audio_asset_id: UUID
+    audio_start_seconds: float = Field(default=0, ge=0, allow_inf_nan=False)
 
 
 class PlanGenerate(BaseModel):
@@ -509,7 +512,7 @@ def variants(shot_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
             "SELECT v.id,v.storage_key,v.mime_type,v.duration,v.review_status,v.created_at,v.generation_attempt_id,"
-            "a.attempt_number,a.job_id,a.parameters FROM shot_variants v JOIN generation_attempts a ON a.id=v.generation_attempt_id "
+            "a.attempt_number,a.job_id,a.parameters,a.provider,a.model FROM shot_variants v JOIN generation_attempts a ON a.id=v.generation_attempt_id "
             "WHERE v.shot_id=%s ORDER BY v.created_at",
             (shot_id,),
         )
@@ -526,6 +529,12 @@ def variants(shot_id: UUID):
             "attempt_number": r[7],
             "job_id": str(r[8]),
             "provenance": r[9],
+            "provider": r[10],
+            "model": r[11],
+            "generation_mode": (
+                (r[9] or {}).get("generation_mode")
+                or ("image-to-video" if (r[9] or {}).get("reference_asset_id") else "text-to-video")
+            ),
         }
         for r in rows
     ]
@@ -951,25 +960,42 @@ def events(project_id: UUID):
 def create_render(project_id: UUID, body: RenderCreate):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
-            "SELECT storage_key FROM assets WHERE id=%s AND project_id=%s",
+            "SELECT storage_key FROM assets WHERE id=%s AND project_id=%s AND asset_type='AUDIO'",
             (body.audio_asset_id, project_id),
         )
         audio = cursor.fetchone()
         if not audio:
             raise HTTPException(404, "audio asset not found")
         cursor.execute(
-            "SELECT v.id,v.storage_key FROM shot_variants v JOIN shots s ON s.id=v.shot_id WHERE v.id = ANY(%s) AND s.project_id=%s",
+            "SELECT v.id,v.storage_key,v.duration FROM shot_variants v JOIN shots s ON s.id=v.shot_id WHERE v.id = ANY(%s) AND s.project_id=%s",
             ([str(value) for value in body.variant_ids], project_id),
         )
         variants = cursor.fetchall()
         if len(variants) != len(body.variant_ids):
             raise HTTPException(404, "one or more variants not found")
         keys = {str(row[0]): row[1] for row in variants}
+        durations = {str(row[0]): float(row[2]) for row in variants}
+        expected_duration = sum(durations[str(value)] for value in body.variant_ids)
+        audio_path = LocalStorage(settings.storage_root).path(audio[0])
+        try:
+            audio_duration = probe_duration(audio_path)
+        except (OSError, RuntimeError, ValueError, KeyError) as exc:
+            raise HTTPException(422, "audio duration could not be read") from exc
+        if not math.isfinite(body.audio_start_seconds):
+            raise HTTPException(422, "audio start must be finite")
+        if body.audio_start_seconds + expected_duration > audio_duration + 0.01:
+            raise HTTPException(
+                422,
+                "audio does not have enough remaining duration for the selected video",
+            )
         render_spec = {
             "variant_ids": [str(value) for value in body.variant_ids],
             "audio_asset_id": str(body.audio_asset_id),
             "audio_key": audio[0],
             "variant_keys": [keys[str(value)] for value in body.variant_ids],
+            "audio_start_seconds": body.audio_start_seconds,
+            "expected_duration": expected_duration,
+            "audio_duration": audio_duration,
         }
         cursor.execute(
             "INSERT INTO renders(project_id,status,render_spec) VALUES (%s,'QUEUED',%s) RETURNING id",
@@ -986,7 +1012,7 @@ def create_render(project_id: UUID, body: RenderCreate):
 def list_renders(project_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
-            "SELECT id,status,output_storage_key,mime_type,duration,error_data,created_at,started_at,completed_at "
+            "SELECT id,status,output_storage_key,mime_type,duration,error_data,render_spec,created_at,started_at,completed_at "
             "FROM renders WHERE project_id=%s ORDER BY created_at DESC",
             (project_id,),
         )
@@ -998,6 +1024,7 @@ def list_renders(project_id: UUID):
         "mime_type",
         "duration",
         "error_data",
+        "render_spec",
         "created_at",
         "started_at",
         "completed_at",
@@ -1009,7 +1036,7 @@ def list_renders(project_id: UUID):
 def get_render(render_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
-            "SELECT id,status,output_storage_key,mime_type,duration,error_data,created_at,started_at,completed_at FROM renders WHERE id=%s",
+            "SELECT id,status,output_storage_key,mime_type,duration,error_data,render_spec,created_at,started_at,completed_at FROM renders WHERE id=%s",
             (render_id,),
         )
         row = cursor.fetchone()
@@ -1024,6 +1051,7 @@ def get_render(render_id: UUID):
                 "mime_type",
                 "duration",
                 "error_data",
+                "render_spec",
                 "created_at",
                 "started_at",
                 "completed_at",

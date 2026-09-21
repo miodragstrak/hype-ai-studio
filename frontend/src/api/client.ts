@@ -32,7 +32,7 @@ export const api = {
   job: (id: string) => request<Job>(`/jobs/${id}`), variants: (id: string) => request<Variant[]>(`/shots/${id}/variants`),
   selectVariant: (shot: string, variant: string) => request(`/shots/${shot}/variants/${variant}/select`, { method: "POST" }),
   rejectVariant: (shot: string, variant: string) => request(`/shots/${shot}/variants/${variant}/reject`, { method: "POST" }),
-  renders: (id: string) => request<Render[]>(`/projects/${id}/renders`), submitRender: (id: string, variants: string[], audio: string) => request<Render>(`/projects/${id}/renders`, json("POST", { variant_ids: variants, audio_asset_id: audio })),
+  renders: (id: string) => request<Render[]>(`/projects/${id}/renders`), submitRender: (id: string, variants: string[], audio: string, audioStartSeconds = 0) => request<Render>(`/projects/${id}/renders`, json("POST", { variant_ids: variants, audio_asset_id: audio, audio_start_seconds: audioStartSeconds })),
   render: (id: string) => request<Render>(`/renders/${id}`), events: (id: string) => request<ActivityEvent[]>(`/projects/${id}/events`),
   media: (kind: "assets" | "variants" | "renders", id: string, download = false) => `${API_BASE}/${kind}/${id}/media${download ? "?download=true" : ""}`,
 };
