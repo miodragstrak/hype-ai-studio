@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import math
 import struct
@@ -10,6 +11,7 @@ from itertools import pairwise
 from pathlib import Path
 
 import pytest
+from PIL import Image, ImageStat
 
 from backend.app.config import settings
 from backend.tests.test_api_integration import create_project, create_shot, submit_generation
@@ -93,7 +95,7 @@ def make_wav(path: Path, duration: float = 1.0, sample_rate: int = 8000) -> None
         output.writeframes(frames)
 
 
-def make_split_wav(path: Path, duration: float = 2.0, sample_rate: int = 8000) -> None:
+def make_split_wav(path: Path, duration: float = 5.0, sample_rate: int = 8000) -> None:
     frames = bytearray()
     for index in range(int(duration * sample_rate)):
         frequency = 220 if index < sample_rate else 880
@@ -185,12 +187,31 @@ def test_variant_selection_and_async_render_through_worker(
         },
     )
     assert invalid_start.status_code == 422
+    invalid_card = client.post(
+        f"/projects/{project_id}/renders",
+        json={
+            "variant_ids": [variants[1]["id"], second_variants[0]["id"]],
+            "audio_asset_id": upload.json()["id"],
+            "intro_card": {
+                "artist_name": "   ",
+                "song_title": "Test Song",
+                "duration_seconds": 11,
+            },
+        },
+    )
+    assert invalid_card.status_code == 422
     too_late = client.post(
         f"/projects/{project_id}/renders",
         json={
             "variant_ids": [variants[1]["id"], second_variants[0]["id"]],
             "audio_asset_id": upload.json()["id"],
-            "audio_start_seconds": 1.3,
+            "audio_start_seconds": 3,
+            "intro_card": {
+                "artist_name": "Test Artist",
+                "song_title": "Test Song",
+                "duration_seconds": 1,
+            },
+            "outro_card": {"text": "End", "duration_seconds": 1},
         },
     )
     assert too_late.status_code == 422
@@ -202,6 +223,12 @@ def test_variant_selection_and_async_render_through_worker(
             "variant_ids": [variants[1]["id"], second_variants[0]["id"]],
             "audio_asset_id": upload.json()["id"],
             "audio_start_seconds": 1,
+            "intro_card": {
+                "artist_name": "Živa proba",
+                "song_title": "Noćni signal",
+                "duration_seconds": 1,
+            },
+            "outro_card": {"text": "Hvala", "duration_seconds": 1},
         },
     )
     render_response_time = time.monotonic() - started
@@ -248,12 +275,18 @@ def test_variant_selection_and_async_render_through_worker(
     codecs = {stream["codec_type"]: stream["codec_name"] for stream in metadata["streams"]}
     assert codecs["video"] == "h264"
     assert codecs["audio"] == "aac"
+    video_stream = next(stream for stream in metadata["streams"] if stream["codec_type"] == "video")
+    assert (video_stream["width"], video_stream["height"]) == (1280, 720)
     assert "mp4" in metadata["format"]["format_name"].split(",")
     duration = float(metadata["format"]["duration"])
-    assert duration == pytest.approx(0.8, abs=0.25)
+    assert duration == pytest.approx(2.8, abs=0.25)
     assert float(render["duration"]) == pytest.approx(duration, abs=0.01)
     assert render["render_spec"]["audio_start_seconds"] == 1
-    assert render["render_spec"]["expected_duration"] == pytest.approx(0.8)
+    assert render["render_spec"]["shot_duration"] == pytest.approx(0.8)
+    assert render["render_spec"]["card_duration"] == pytest.approx(2)
+    assert render["render_spec"]["expected_duration"] == pytest.approx(2.8)
+    assert render["render_spec"]["intro_card"]["artist_name"] == "Živa proba"
+    assert render["render_spec"]["outro_card"]["text"] == "Hvala"
     decoded = subprocess.run(
         [
             settings.ffmpeg_executable,
@@ -283,6 +316,33 @@ def test_variant_selection_and_async_render_through_worker(
     )
     estimated_frequency = crossings / (2 * (len(samples) / 8000))
     assert estimated_frequency == pytest.approx(880, abs=100)
+    frame_means = []
+    for position in (0.2, 1.4, 2.6):
+        frame_data = subprocess.run(
+            [
+                settings.ffmpeg_executable,
+                "-v",
+                "error",
+                "-ss",
+                str(position),
+                "-i",
+                str(output),
+                "-frames:v",
+                "1",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "png",
+                "pipe:1",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        ).stdout
+        with Image.open(io.BytesIO(frame_data)) as frame:
+            frame_means.append(sum(ImageStat.Stat(frame.convert("RGB")).mean) / 3)
+    assert frame_means[0] < frame_means[1]
+    assert frame_means[2] < frame_means[1]
     events = client.get(f"/projects/{project_id}/events").json()
     event_types = [event["event_type"] for event in events]
     assert event_types.count("VARIANT_CREATED") == 3
@@ -305,3 +365,39 @@ def test_variant_selection_and_async_render_through_worker(
     )
     assert legacy.status_code == 202
     assert client.get(f"/renders/{legacy.json()['id']}").json()["render_spec"]["audio_start_seconds"] == 0
+    legacy_spec = client.get(f"/renders/{legacy.json()['id']}").json()["render_spec"]
+    assert legacy_spec["intro_card"] is None
+    assert legacy_spec["outro_card"] is None
+    assert legacy_spec["expected_duration"] == pytest.approx(0.8)
+
+    intro_only = client.post(
+        f"/projects/{project_id}/renders",
+        json={
+            "variant_ids": [variants[1]["id"], second_variants[0]["id"]],
+            "audio_asset_id": upload.json()["id"],
+            "intro_card": {
+                "artist_name": "Artist",
+                "song_title": "Song",
+                "duration_seconds": 1,
+            },
+        },
+    )
+    assert intro_only.status_code == 202
+    intro_spec = client.get(f"/renders/{intro_only.json()['id']}").json()["render_spec"]
+    assert intro_spec["intro_card"]["song_title"] == "Song"
+    assert intro_spec["outro_card"] is None
+    assert intro_spec["expected_duration"] == pytest.approx(1.8)
+
+    outro_only = client.post(
+        f"/projects/{project_id}/renders",
+        json={
+            "variant_ids": [variants[1]["id"], second_variants[0]["id"]],
+            "audio_asset_id": upload.json()["id"],
+            "outro_card": {"text": "Thanks", "duration_seconds": 1},
+        },
+    )
+    assert outro_only.status_code == 202
+    outro_spec = client.get(f"/renders/{outro_only.json()['id']}").json()["render_spec"]
+    assert outro_spec["intro_card"] is None
+    assert outro_spec["outro_card"]["text"] == "Thanks"
+    assert outro_spec["expected_duration"] == pytest.approx(1.8)

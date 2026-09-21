@@ -1,4 +1,4 @@
-import type { ActivityEvent, Asset, Job, Plan, PlanGenerateInput, PlanSummary, Project, Render, Shot, Variant } from "../types";
+import type { ActivityEvent, Asset, IntroCard, Job, OutroCard, Plan, PlanGenerateInput, PlanSummary, Project, Render, Shot, Variant } from "../types";
 
 export const API_BASE = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
 export class ApiError extends Error { constructor(public status: number, message: string) { super(message); } }
@@ -32,7 +32,7 @@ export const api = {
   job: (id: string) => request<Job>(`/jobs/${id}`), variants: (id: string) => request<Variant[]>(`/shots/${id}/variants`),
   selectVariant: (shot: string, variant: string) => request(`/shots/${shot}/variants/${variant}/select`, { method: "POST" }),
   rejectVariant: (shot: string, variant: string) => request(`/shots/${shot}/variants/${variant}/reject`, { method: "POST" }),
-  renders: (id: string) => request<Render[]>(`/projects/${id}/renders`), submitRender: (id: string, variants: string[], audio: string, audioStartSeconds = 0) => request<Render>(`/projects/${id}/renders`, json("POST", { variant_ids: variants, audio_asset_id: audio, audio_start_seconds: audioStartSeconds })),
+  renders: (id: string) => request<Render[]>(`/projects/${id}/renders`), submitRender: (id: string, variants: string[], audio: string, audioStartSeconds = 0, cards: { intro_card?: IntroCard; outro_card?: OutroCard } = {}) => request<Render>(`/projects/${id}/renders`, json("POST", { variant_ids: variants, audio_asset_id: audio, audio_start_seconds: audioStartSeconds, ...cards })),
   render: (id: string) => request<Render>(`/renders/${id}`), events: (id: string) => request<ActivityEvent[]>(`/projects/${id}/events`),
   media: (kind: "assets" | "variants" | "renders", id: string, download = false) => `${API_BASE}/${kind}/${id}/media${download ? "?download=true" : ""}`,
 };
