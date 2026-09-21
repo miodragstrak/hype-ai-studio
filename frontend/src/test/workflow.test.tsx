@@ -10,7 +10,7 @@ it("creates, uploads, generates, reviews, and renders through real routes", asyn
   const project: Project = { id: "p1", project_type: "MUSIC_VIDEO", title: "Launch Film", creative_brief: "A performance-led launch film", aspect_ratio: "16:9", status: "DRAFT", created_at: "x", updated_at: "x", summary: { assets: 0, shots: 0, selected_variants: 0, renders: 0 } };
   const audio: Asset = { id: "audio", asset_type: "AUDIO", filename: "song.wav", mime_type: "audio/wav", size_bytes: 100, checksum: "x", rights_metadata: { usage_confirmed: true }, created_at: "x" };
   let assets: Asset[] = []; let shots: Shot[] = []; let selected = false;
-  const variant: Variant = { id: "v1", mime_type: "video/mp4", duration: 3, review_status: "UNREVIEWED", created_at: "x", generation_attempt_id: "a1", attempt_number: 1, job_id: "j1" };
+  const variant: Variant = { id: "v1", mime_type: "video/mp4", duration: 3, review_status: "UNREVIEWED", created_at: "x", generation_attempt_id: "a1", attempt_number: 1, job_id: "j1", provider: "mock", model: "mock-video-v1", generation_mode: "text-to-video" };
   vi.spyOn(api, "createProject").mockResolvedValue(project); vi.spyOn(api, "project").mockResolvedValue(project); vi.spyOn(api, "events").mockResolvedValue([]);
   vi.spyOn(api, "assets").mockImplementation(async () => assets); vi.spyOn(api, "uploadAsset").mockImplementation(async () => { assets = [audio]; return { id: "audio" }; });
   vi.spyOn(api, "shots").mockImplementation(async () => shots.map(shot => selected ? { ...shot, selected_variant_id: "v1", latest_job_status: "SUCCEEDED" } : shot));

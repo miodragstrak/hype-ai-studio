@@ -420,7 +420,12 @@ def process_render(render_id: str) -> None:
         spec = row[1]
         inputs = [storage.path(key) for key in spec["variant_keys"]]
         output_key = f"projects/{row[0]}/renders/{render_id}.mp4"
-        duration = compose_video(inputs, storage.path(spec["audio_key"]), storage.path(output_key))
+        duration = compose_video(
+            inputs,
+            storage.path(spec["audio_key"]),
+            storage.path(output_key),
+            float(spec.get("audio_start_seconds", 0)),
+        )
         with connection() as conn, conn.cursor() as cursor:
             cursor.execute(
                 "UPDATE renders SET status='SUCCEEDED',output_storage_key=%s,mime_type='video/mp4',duration=%s,completed_at=now() WHERE id=%s",
