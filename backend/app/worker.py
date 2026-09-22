@@ -24,11 +24,12 @@ from backend.app.providers.runway import (
     ReferenceUploadError,
 )
 from backend.app.queue import dequeue, enqueue
-from backend.app.render import compose_video
+from backend.app.render import compose_tour_video, compose_video
 from backend.app.security import sanitize, sanitize_text
 from backend.app.services.jobs import transition
 from backend.app.services.planning_budget import reconcile_budget, reserve_budget
 from backend.app.services.runway_budget import BudgetExceededError, reserve_attempt
+from backend.app.services.tour_render import build_tour_snapshot, file_checksum
 from backend.app.storage.local import LocalStorage
 
 
@@ -46,6 +47,32 @@ def process_generation(job_id: str) -> None:
         shot = cursor.fetchone()
     if job[5] in {"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT"}:
         return
+    tour_provenance = (job[6] or {}).get("tour_provenance")
+    if tour_provenance:
+        with connection() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT p.project_type,s.source_plan_id,s.source_plan_version,pp.status,"
+                "pp.materialized_at FROM shots s JOIN projects p ON p.id=s.project_id "
+                "LEFT JOIN project_plans pp ON pp.id=s.source_plan_id WHERE s.id=%s",
+                (job[2],),
+            )
+            current = cursor.fetchone()
+        valid = bool(
+            current
+            and current[0] == "TOUR_GUIDE"
+            and str(current[1]) == tour_provenance.get("source_plan_id")
+            and current[2] == tour_provenance.get("source_plan_version")
+            and current[3] == "APPROVED"
+            and current[4] is not None
+            and settings.video_provider == "mock"
+        )
+        if not valid:
+            transition(
+                job[0],
+                JobStatus.FAILED,
+                {"message": "tour guide shot provenance is no longer valid", "retryable": False},
+            )
+            return
     if settings.video_provider == "runway":
         _process_runway_generation(job, shot)
         return
@@ -53,6 +80,7 @@ def process_generation(job_id: str) -> None:
 
 
 def _process_mock_generation(job, shot) -> None:
+    tour_provenance = (job[6] or {}).get("tour_provenance")
     failure_mode = settings.mock_provider_failure_mode
     if failure_mode.startswith("transient:"):
         failure_count = int(failure_mode.partition(":")[2])
@@ -61,7 +89,12 @@ def _process_mock_generation(job, shot) -> None:
     attempt_id = None
     try:
         transition(job[0], JobStatus.SUBMITTING)
-        request = GenerationRequest(shot[0], "16:9", float(shot[1]), correlation_id=str(job[0]))
+        request = GenerationRequest(
+            shot[0],
+            "9:16" if tour_provenance else "16:9",
+            float(shot[1]),
+            correlation_id=str(job[0]),
+        )
         provider_id = provider.submit_generation(request)
         with connection() as conn, conn.cursor() as cursor:
             cursor.execute(
@@ -74,7 +107,13 @@ def _process_mock_generation(job, shot) -> None:
                     provider.model,
                     provider_id,
                     shot[0],
-                    Jsonb({}),
+                    Jsonb(
+                        {
+                            "generation_mode": "text-to-video",
+                            "aspect_ratio": "9:16" if tour_provenance else "16:9",
+                            **({"tour_provenance": tour_provenance} if tour_provenance else {}),
+                        }
+                    ),
                     job[3] + 1,
                 ),
             )
@@ -408,16 +447,20 @@ def _process_runway_generation(job, shot) -> None:
 def process_render(render_id: str) -> None:
     storage = LocalStorage(settings.storage_root)
     with connection() as conn, conn.cursor() as cursor:
-        cursor.execute("SELECT project_id,render_spec FROM renders WHERE id=%s", (render_id,))
+        cursor.execute(
+            "UPDATE renders SET status='PROCESSING',started_at=now() "
+            "WHERE id=%s AND status='QUEUED' RETURNING project_id,render_spec",
+            (render_id,),
+        )
         row = cursor.fetchone()
         if not row:
             return
-        cursor.execute(
-            "UPDATE renders SET status='PROCESSING',started_at=now() WHERE id=%s", (render_id,)
-        )
         conn.commit()
     try:
         spec = row[1]
+        if spec.get("render_type") == "TOUR_GUIDE":
+            _process_tour_render(render_id, row[0], spec, storage)
+            return
         inputs = [storage.path(key) for key in spec["variant_keys"]]
         output_key = f"projects/{row[0]}/renders/{render_id}.mp4"
         duration = compose_video(
@@ -443,6 +486,98 @@ def process_render(render_id: str) -> None:
             cursor.execute(
                 "UPDATE renders SET status='FAILED',error_data=%s,completed_at=now() WHERE id=%s",
                 (Jsonb({"message": str(exc)}), render_id),
+            )
+            conn.commit()
+
+
+def _process_tour_render(render_id: str, project_id, spec: dict, storage: LocalStorage) -> None:
+    output_key = f"projects/{project_id}/renders/{render_id}.mp4"
+    try:
+        with connection() as conn, conn.cursor() as cursor:
+            current = build_tour_snapshot(cursor, project_id)
+            music = spec.get("music")
+            if music:
+                cursor.execute(
+                    "SELECT storage_key,checksum,rights_metadata FROM assets WHERE id=%s AND project_id=%s AND asset_type='TOUR_MUSIC'",
+                    (music["asset_id"], project_id),
+                )
+                music_row = cursor.fetchone()
+                if not music_row or music_row[2].get("usage_confirmed") is not True:
+                    raise ValueError("tour music provenance is no longer valid")
+                if music_row[0] != music["storage_key"] or music_row[1] != music["checksum"]:
+                    raise ValueError("tour music input changed after submission")
+        if any(
+            current[field] != spec.get(field)
+            for field in ("source_plan_id", "source_plan_version", "expected_duration")
+        ):
+            raise ValueError("tour render inputs changed after submission")
+        snapshot_shot_fields = (
+            "shot_id",
+            "ordinal",
+            "source_plan_item_key",
+            "duration",
+            "variant_id",
+            "variant_key",
+            "voiceover_asset_id",
+            "voiceover_key",
+            "voiceover_checksum",
+            "narration_checksum",
+            "voiceover_duration",
+        )
+        expected_shots = [
+            {field: shot[field] for field in snapshot_shot_fields} for shot in spec["shots"]
+        ]
+        if current["shots"] != expected_shots:
+            raise ValueError("tour render inputs changed after submission")
+        inputs = []
+        for shot in spec["shots"]:
+            variant_path = storage.path(shot["variant_key"])
+            voiceover_path = storage.path(shot["voiceover_key"])
+            if file_checksum(variant_path) != shot["variant_checksum"]:
+                raise ValueError(f"shot {shot['ordinal']} variant file changed after submission")
+            if file_checksum(voiceover_path) != shot["voiceover_checksum"]:
+                raise ValueError(f"shot {shot['ordinal']} voiceover file changed after submission")
+            inputs.append({**shot, "variant_path": variant_path, "voiceover_path": voiceover_path})
+        music_path = storage.path(spec["music"]["storage_key"]) if spec.get("music") else None
+        if music_path and file_checksum(music_path) != spec["music"]["checksum"]:
+            raise ValueError("tour music file changed after submission")
+        duration = compose_tour_video(
+            inputs,
+            storage.path(output_key),
+            music_path,
+            spec.get("opening_title", ""),
+            spec.get("closing_title", ""),
+        )
+        with connection() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                "UPDATE renders SET status='SUCCEEDED',output_storage_key=%s,mime_type='video/mp4',duration=%s,error_data=NULL,completed_at=now() WHERE id=%s",
+                (output_key, duration, render_id),
+            )
+            cursor.execute(
+                "INSERT INTO events(project_id,event_type,actor_type,entity_type,entity_id,payload) VALUES (%s,'TOUR_RENDER_COMPLETED','worker','render',%s,%s)",
+                (
+                    project_id,
+                    render_id,
+                    Jsonb(
+                        {
+                            "storage_key": output_key,
+                            "source_plan_id": spec["source_plan_id"],
+                            "source_plan_version": spec["source_plan_version"],
+                        }
+                    ),
+                ),
+            )
+            conn.commit()
+    except Exception as exc:  # noqa: BLE001 - persisted as a failed render
+        storage.path(output_key).unlink(missing_ok=True)
+        with connection() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                "UPDATE renders SET status='FAILED',output_storage_key=NULL,mime_type=NULL,duration=NULL,error_data=%s,completed_at=now() WHERE id=%s",
+                (Jsonb({"message": str(exc)}), render_id),
+            )
+            cursor.execute(
+                "INSERT INTO events(project_id,event_type,actor_type,entity_type,entity_id,payload) VALUES (%s,'TOUR_RENDER_FAILED','worker','render',%s,%s)",
+                (project_id, render_id, Jsonb({"message": str(exc)})),
             )
             conn.commit()
 

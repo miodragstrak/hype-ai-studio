@@ -79,7 +79,9 @@ class PlanningResult(BaseModel):
                     value and value.strip()
                     for value in (scene.location_or_motif, scene.pov_description, scene.narration)
                 ):
-                    raise ValueError("tour guide scenes require location, POV description, and narration")
+                    raise ValueError(
+                        "tour guide scenes require location, POV description, and narration"
+                    )
         return self
 
 

@@ -19,6 +19,7 @@ docker compose up -d postgres redis
 psql "$DATABASE_URL" -f supabase/migrations/001_initial_schema.sql
 psql "$DATABASE_URL" -f supabase/migrations/002_project_plans.sql
 psql "$DATABASE_URL" -f supabase/migrations/003_tour_shot_provenance.sql
+psql "$DATABASE_URL" -f supabase/migrations/004_tour_voiceovers.sql
 uvicorn backend.app.api:app --reload
 python -m backend.app.worker
 cd frontend && npm install && npm run dev

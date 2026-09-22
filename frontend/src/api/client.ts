@@ -1,4 +1,4 @@
-import type { ActivityEvent, Asset, IntroCard, Job, OutroCard, Plan, PlanGenerateInput, PlanSummary, Project, Render, Shot, Variant } from "../types";
+import type { ActivityEvent, Asset, IntroCard, Job, OutroCard, Plan, PlanGenerateInput, PlanSummary, Project, Render, Shot, TourTimeline, Variant } from "../types";
 
 export const API_BASE = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
 export class ApiError extends Error { constructor(public status: number, message: string) { super(message); } }
@@ -16,6 +16,9 @@ export const api = {
   projects: () => request<Project[]>("/projects"), project: (id: string) => request<Project>(`/projects/${id}`),
   createProject: (body: { title: string; creative_brief: string; project_type?: Project["project_type"]; aspect_ratio?: string }) => request<Project>("/projects", json("POST", { project_type: "MUSIC_VIDEO", aspect_ratio: "16:9", ...body })),
   assets: (id: string) => request<Asset[]>(`/projects/${id}/assets`), uploadAsset: (id: string, data: FormData) => request<{ id: string }>(`/projects/${id}/assets`, { method: "POST", body: data }),
+  uploadVoiceover: (shotId: string, file: File) => { const data = new FormData(); data.append("file", file); return request<{ id: string; shot_id: string; duration: number; mime_type: string }>(`/shots/${shotId}/voiceover`, { method: "POST", body: data }); },
+  uploadTourMusic: (projectId: string, file: File, rightsMetadata: Record<string, unknown>) => { const data = new FormData(); data.append("file", file); data.append("rights_metadata", JSON.stringify(rightsMetadata)); return request<{ id: string; duration: number; mime_type: string }>(`/projects/${projectId}/tour-music`, { method: "POST", body: data }); },
+  tourTimeline: (projectId: string) => request<TourTimeline>(`/projects/${projectId}/tour-timeline`),
   plans: (id: string) => request<PlanSummary[]>(`/projects/${id}/plans`),
   plan: (projectId: string, planId: string) => request<Plan>(`/projects/${projectId}/plans/${planId}`),
   generatePlan: (id: string, body: PlanGenerateInput) => request<{ job_id: string; status: string; deduplicated: boolean }>(`/projects/${id}/plans/generate`, json("POST", body)),
@@ -34,6 +37,7 @@ export const api = {
   selectVariant: (shot: string, variant: string) => request(`/shots/${shot}/variants/${variant}/select`, { method: "POST" }),
   rejectVariant: (shot: string, variant: string) => request(`/shots/${shot}/variants/${variant}/reject`, { method: "POST" }),
   renders: (id: string) => request<Render[]>(`/projects/${id}/renders`), submitRender: (id: string, variants: string[], audio: string, audioStartSeconds = 0, cards: { intro_card?: IntroCard; outro_card?: OutroCard } = {}) => request<Render>(`/projects/${id}/renders`, json("POST", { variant_ids: variants, audio_asset_id: audio, audio_start_seconds: audioStartSeconds, ...cards })),
+  submitTourRender: (id: string, body: { opening_title: string; closing_title: string; music_asset_id: string | null }) => request<Render>(`/projects/${id}/tour-renders`, json("POST", body)),
   render: (id: string) => request<Render>(`/renders/${id}`), events: (id: string) => request<ActivityEvent[]>(`/projects/${id}/events`),
   media: (kind: "assets" | "variants" | "renders", id: string, download = false) => `${API_BASE}/${kind}/${id}/media${download ? "?download=true" : ""}`,
 };
