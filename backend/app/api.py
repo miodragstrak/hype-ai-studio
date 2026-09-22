@@ -4,15 +4,16 @@ import json
 import math
 from datetime import datetime
 from pathlib import PurePath
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
+from psycopg import Error as PsycopgError
 from psycopg.types.json import Jsonb
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from backend.app.config import settings
 from backend.app.db import connection
@@ -32,10 +33,19 @@ app.add_middleware(
 
 
 class ProjectCreate(BaseModel):
-    project_type: str = "MUSIC_VIDEO"
-    title: str
-    creative_brief: str = ""
+    project_type: Literal["MUSIC_VIDEO", "TOUR_GUIDE"] = "MUSIC_VIDEO"
+    title: str = Field(min_length=2, max_length=120)
+    creative_brief: str = Field(default="", max_length=2000)
     aspect_ratio: str = "16:9"
+
+    @model_validator(mode="after")
+    def validate_project_format(self):
+        if self.project_type == "TOUR_GUIDE":
+            if self.aspect_ratio != "9:16":
+                raise ValueError("tour guide projects require a 9:16 aspect ratio")
+            if len(self.creative_brief.strip()) < 20:
+                raise ValueError("tour guide brief must contain at least 20 characters")
+        return self
 
 
 class ShotCreate(BaseModel):
@@ -120,6 +130,13 @@ class PlanApprovalResponse(BaseModel):
     idempotent: bool
 
 
+class PlanHandoffResponse(BaseModel):
+    plan_id: UUID
+    status: str
+    created_shot_ids: list[UUID]
+    idempotent: bool
+
+
 class PlanJobResponse(BaseModel):
     job_id: UUID
     status: str
@@ -167,7 +184,7 @@ def list_projects():
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
             "SELECT id,project_type,title,creative_brief,aspect_ratio,status,created_at,updated_at "
-            "FROM projects WHERE project_type='MUSIC_VIDEO' ORDER BY updated_at DESC,created_at DESC"
+            "FROM projects ORDER BY updated_at DESC,created_at DESC"
         )
         rows = cursor.fetchall()
     fields = (
@@ -349,7 +366,9 @@ def list_shots(project_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
             "SELECT s.id,s.ordinal,s.title,s.prompt,s.intended_duration,s.status,s.selected_variant_id,"
-            "s.source_plan_id,s.source_plan_item_key,"
+            "s.source_plan_id,s.source_plan_item_key,s.source_plan_version,s.source_scene_duration,"
+            "s.source_location_or_motif,s.source_pov_description,s.source_narration,"
+            "s.source_factual_claims,"
             "j.id,j.status FROM shots s LEFT JOIN LATERAL "
             "(SELECT id,status FROM jobs WHERE shot_id=s.id ORDER BY created_at DESC LIMIT 1) j ON true "
             "WHERE s.project_id=%s ORDER BY s.ordinal",
@@ -367,8 +386,14 @@ def list_shots(project_id: UUID):
             "selected_variant_id": str(row[6]) if row[6] else None,
             "source_plan_id": str(row[7]) if row[7] else None,
             "source_plan_item_key": row[8],
-            "latest_job_id": str(row[9]) if row[9] else None,
-            "latest_job_status": row[10],
+            "source_plan_version": row[9],
+            "source_scene_duration": float(row[10]) if row[10] is not None else None,
+            "source_location_or_motif": row[11],
+            "source_pov_description": row[12],
+            "source_narration": row[13],
+            "source_factual_claims": row[14],
+            "latest_job_id": str(row[15]) if row[15] else None,
+            "latest_job_status": row[16],
         }
         for row in rows
     ]
@@ -658,12 +683,19 @@ _PLAN_COLUMNS = (
 def generate_plan(project_id: UUID, body: PlanGenerate):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
-            "SELECT creative_brief,aspect_ratio,title FROM projects WHERE id=%s AND project_type='MUSIC_VIDEO'",
+            "SELECT creative_brief,aspect_ratio,title,project_type FROM projects WHERE id=%s",
             (project_id,),
         )
         project = cursor.fetchone()
         if project is None:
-            raise HTTPException(404, "music video project not found")
+            raise HTTPException(404, "project not found")
+        if project[3] == "TOUR_GUIDE":
+            if settings.planning_provider != "mock":
+                raise HTTPException(422, "tour guide planning supports the mock provider only")
+            if not 30 <= body.target_duration_seconds <= 45:
+                raise HTTPException(422, "tour guide duration must be between 30 and 45 seconds")
+            if not 4 <= body.maximum_shot_count <= 5:
+                raise HTTPException(422, "tour guide plans require 4 or 5 scenes")
         assets = []
         if body.use_reference_assets:
             cursor.execute(
@@ -682,7 +714,7 @@ def generate_plan(project_id: UUID, body: PlanGenerate):
             ]
         request = PlanningRequest(
             project_id=str(project_id),
-            project_type="MUSIC_VIDEO",
+            project_type=project[3],
             project_title=project[2],
             creative_brief=project[0],
             target_duration_seconds=body.target_duration_seconds,
@@ -723,10 +755,10 @@ def generate_plan(project_id: UUID, body: PlanGenerate):
 def list_plans(project_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
-            "SELECT 1 FROM projects WHERE id=%s AND project_type='MUSIC_VIDEO'", (project_id,)
+            "SELECT 1 FROM projects WHERE id=%s", (project_id,)
         )
         if cursor.fetchone() is None:
-            raise HTTPException(404, "music video project not found")
+            raise HTTPException(404, "project not found")
         cursor.execute(
             "SELECT id,version,status,concept_title,provider,model,created_at,approved_at FROM project_plans WHERE project_id=%s ORDER BY version DESC",
             (project_id,),
@@ -787,6 +819,13 @@ def create_plan_version(project_id: UUID, plan_id: UUID, body: PlanVersionCreate
         if parent is None:
             raise HTTPException(404, "plan not found")
         inputs = parent[5]
+        expected_schema = (
+            "tour-guide-plan-v1"
+            if inputs.get("project_type") == "TOUR_GUIDE"
+            else "music-video-plan-v1"
+        )
+        if body.schema_version != expected_schema:
+            raise HTTPException(422, "plan schema does not match project type")
         cursor.execute("SELECT id FROM assets WHERE project_id=%s", (project_id,))
         allowed = {str(row[0]) for row in cursor.fetchall()}
         try:
@@ -795,6 +834,7 @@ def create_plan_version(project_id: UUID, plan_id: UUID, body: PlanVersionCreate
                 target_duration=float(inputs["target_duration_seconds"]),
                 maximum_shots=int(inputs["maximum_shot_count"]),
                 allowed_asset_ids=allowed,
+                require_verified_sources=False,
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
@@ -843,6 +883,7 @@ def approve_plan(project_id: UUID, plan_id: UUID):
         if row is None:
             raise HTTPException(404, "plan not found")
         detail = _plan_detail(row)
+        project_type = detail["planning_inputs"].get("project_type", "MUSIC_VIDEO")
         try:
             result = PlanningResult.model_validate(
                 {
@@ -872,7 +913,7 @@ def approve_plan(project_id: UUID, plan_id: UUID):
             raise HTTPException(422, str(exc)) from exc
         cursor.execute("SELECT id FROM shots WHERE source_plan_id=%s ORDER BY ordinal", (plan_id,))
         existing = [item[0] for item in cursor.fetchall()]
-        if row[3] == "APPROVED" and row[17] is not None:
+        if row[3] == "APPROVED":
             conn.commit()
             return PlanApprovalResponse(
                 plan_id=plan_id, status="APPROVED", created_shot_ids=existing, idempotent=True
@@ -882,7 +923,7 @@ def approve_plan(project_id: UUID, plan_id: UUID):
             (project_id, plan_id),
         )
         prior = cursor.fetchone()
-        if prior:
+        if prior and project_type == "MUSIC_VIDEO":
             cursor.execute(
                 "SELECT count(*) FROM generation_attempts ga JOIN shots s ON s.id=ga.shot_id WHERE s.source_plan_id=%s",
                 (prior[0],),
@@ -920,46 +961,196 @@ def approve_plan(project_id: UUID, plan_id: UUID):
                 prior[0],
                 {"replacement_plan_id": str(plan_id)},
             )
-        cursor.execute(
-            "SELECT COALESCE(max(ordinal),0) FROM shots WHERE project_id=%s AND source_plan_id IS NULL",
-            (project_id,),
-        )
-        offset = cursor.fetchone()[0]
-        created = []
-        for shot in result.shots:
-            cursor.execute(
-                "INSERT INTO shots(project_id,ordinal,title,prompt,intended_duration,status,source_plan_id,source_plan_item_key) VALUES (%s,%s,%s,%s,%s,'PLANNED',%s,%s) ON CONFLICT (source_plan_id,source_plan_item_key) WHERE source_plan_id IS NOT NULL DO NOTHING RETURNING id",
-                (
-                    project_id,
-                    offset + shot.ordinal,
-                    shot.title,
-                    shot.prompt,
-                    shot.duration_seconds,
-                    plan_id,
-                    shot.item_key,
-                ),
+        elif prior:
+            cursor.execute("UPDATE project_plans SET status='SUPERSEDED' WHERE id=%s", (prior[0],))
+            record_event(
+                cursor,
+                project_id,
+                "PLAN_SUPERSEDED",
+                "project_plan",
+                prior[0],
+                {"replacement_plan_id": str(plan_id)},
             )
-            inserted = cursor.fetchone()
-            if inserted:
-                created.append(inserted[0])
+        created = []
+        if project_type == "MUSIC_VIDEO":
+            cursor.execute(
+                "SELECT COALESCE(max(ordinal),0) FROM shots WHERE project_id=%s AND source_plan_id IS NULL",
+                (project_id,),
+            )
+            offset = cursor.fetchone()[0]
+            for shot in result.shots:
+                cursor.execute(
+                    "INSERT INTO shots(project_id,ordinal,title,prompt,intended_duration,status,source_plan_id,source_plan_item_key) VALUES (%s,%s,%s,%s,%s,'PLANNED',%s,%s) ON CONFLICT (source_plan_id,source_plan_item_key) WHERE source_plan_id IS NOT NULL DO NOTHING RETURNING id",
+                    (
+                        project_id,
+                        offset + shot.ordinal,
+                        shot.title,
+                        shot.prompt,
+                        shot.duration_seconds,
+                        plan_id,
+                        shot.item_key,
+                    ),
+                )
+                inserted = cursor.fetchone()
+                if inserted:
+                    created.append(inserted[0])
         cursor.execute(
-            "UPDATE project_plans SET status='APPROVED',approved_at=now(),materialized_at=now() WHERE id=%s",
-            (plan_id,),
-        )
-        record_event(
-            cursor, project_id, "PLAN_APPROVED", "project_plan", plan_id, {"version": row[2]}
+            "UPDATE project_plans SET status='APPROVED',approved_at=now(),"
+            "materialized_at=CASE WHEN %s THEN now() ELSE NULL END WHERE id=%s",
+            (project_type == "MUSIC_VIDEO", plan_id),
         )
         record_event(
             cursor,
             project_id,
-            "PLAN_SHOTS_MATERIALIZED",
+            "PLAN_APPROVED",
             "project_plan",
             plan_id,
-            {"shot_ids": [str(value) for value in created]},
+            {"version": row[2], "project_type": project_type},
         )
+        if project_type == "MUSIC_VIDEO":
+            record_event(
+                cursor,
+                project_id,
+                "PLAN_SHOTS_MATERIALIZED",
+                "project_plan",
+                plan_id,
+                {"shot_ids": [str(value) for value in created]},
+            )
         conn.commit()
     return PlanApprovalResponse(
         plan_id=plan_id, status="APPROVED", created_shot_ids=created, idempotent=False
+    )
+
+
+@app.post(
+    "/projects/{project_id}/plans/{plan_id}/handoff", response_model=PlanHandoffResponse
+)
+def handoff_tour_plan(project_id: UUID, plan_id: UUID):
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            f"SELECT {_PLAN_COLUMNS} FROM project_plans WHERE id=%s AND project_id=%s FOR UPDATE",
+            (plan_id, project_id),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(404, "plan not found")
+        detail = _plan_detail(row)
+        if detail["planning_inputs"].get("project_type") != "TOUR_GUIDE":
+            raise HTTPException(422, "handoff is available only for tour guide plans")
+        if detail["status"] != "APPROVED":
+            raise HTTPException(409, "tour guide plan must be approved before handoff")
+        try:
+            result = PlanningResult.model_validate(
+                {
+                    "schema_version": detail["schema_version"],
+                    "concept_title": detail["concept_title"],
+                    "logline": detail["logline"],
+                    "treatment": detail["treatment"],
+                    "creative_direction": detail["creative_direction"],
+                    "shots": detail["shots"],
+                }
+            )
+            validate_plan(
+                result,
+                target_duration=float(detail["planning_inputs"]["target_duration_seconds"]),
+                maximum_shots=int(detail["planning_inputs"]["maximum_shot_count"]),
+                allowed_asset_ids=set(),
+            )
+        except (ValidationError, ValueError, KeyError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+        cursor.execute(
+            "SELECT id,source_plan_item_key,source_plan_version,source_scene_duration,"
+            "source_location_or_motif,source_pov_description,source_narration,"
+            "source_factual_claims FROM shots WHERE source_plan_id=%s ORDER BY ordinal",
+            (plan_id,),
+        )
+        existing = cursor.fetchall()
+        if existing:
+            expected = [
+                (
+                    scene.item_key,
+                    detail["version"],
+                    scene.duration_seconds,
+                    scene.location_or_motif,
+                    scene.pov_description,
+                    scene.narration,
+                    [claim.model_dump() for claim in scene.factual_claims],
+                )
+                for scene in result.shots
+            ]
+            persisted = [tuple(item[1:]) for item in existing]
+            if persisted != expected:
+                raise HTTPException(409, "existing handoff is incomplete or inconsistent")
+            conn.commit()
+            return PlanHandoffResponse(
+                plan_id=plan_id,
+                status="MATERIALIZED",
+                created_shot_ids=[item[0] for item in existing],
+                idempotent=True,
+            )
+
+        cursor.execute(
+            "SELECT s.id FROM shots s WHERE s.project_id=%s AND s.source_plan_id IS NOT NULL "
+            "AND s.source_plan_id<>%s",
+            (project_id, plan_id),
+        )
+        prior_shot_ids = [item[0] for item in cursor.fetchall()]
+        if prior_shot_ids:
+            cursor.execute(
+                "SELECT EXISTS(SELECT 1 FROM generation_attempts WHERE shot_id=ANY(%s)) OR "
+                "EXISTS(SELECT 1 FROM shots WHERE id=ANY(%s) AND selected_variant_id IS NOT NULL)",
+                (prior_shot_ids, prior_shot_ids),
+            )
+            if cursor.fetchone()[0]:
+                raise HTTPException(
+                    409, "existing production shots have generation or producer review history"
+                )
+            cursor.execute("DELETE FROM shots WHERE id=ANY(%s)", (prior_shot_ids,))
+
+        created: list[UUID] = []
+        try:
+            for scene in result.shots:
+                cursor.execute(
+                    "INSERT INTO shots(project_id,ordinal,title,prompt,intended_duration,status,"
+                    "source_plan_id,source_plan_item_key,source_plan_version,source_scene_duration,"
+                    "source_location_or_motif,"
+                    "source_pov_description,source_narration,source_factual_claims) "
+                    "VALUES (%s,%s,%s,%s,%s,'PLANNED',%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (
+                        project_id,
+                        scene.ordinal,
+                        scene.title,
+                        scene.prompt,
+                        scene.duration_seconds,
+                        plan_id,
+                        scene.item_key,
+                        detail["version"],
+                        scene.duration_seconds,
+                        scene.location_or_motif,
+                        scene.pov_description,
+                        scene.narration,
+                        Jsonb([claim.model_dump() for claim in scene.factual_claims]),
+                    ),
+                )
+                created.append(cursor.fetchone()[0])
+        except PsycopgError as exc:
+            conn.rollback()
+            raise HTTPException(
+                500, "tour plan handoff failed; no production shots were created"
+            ) from exc
+        cursor.execute("UPDATE project_plans SET materialized_at=now() WHERE id=%s", (plan_id,))
+        record_event(
+            cursor,
+            project_id,
+            "TOUR_PLAN_SHOTS_MATERIALIZED",
+            "project_plan",
+            plan_id,
+            {"version": detail["version"], "shot_ids": [str(value) for value in created]},
+        )
+        conn.commit()
+    return PlanHandoffResponse(
+        plan_id=plan_id, status="MATERIALIZED", created_shot_ids=created, idempotent=False
     )
 
 

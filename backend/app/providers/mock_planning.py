@@ -16,6 +16,11 @@ class MockPlanningProvider:
         self.jobs: dict[str, dict] = {}
 
     def submit_plan(self, request: PlanningRequest) -> str:
+        self.model = (
+            "mock-tour-guide-planner-v1"
+            if request.project_type == "TOUR_GUIDE"
+            else "mock-music-video-planner-v1"
+        )
         job_id = f"mock-plan-{uuid4()}"
         self.jobs[job_id] = {"request": request, "created": time.monotonic(), "cancelled": False}
         return job_id
@@ -47,6 +52,8 @@ class MockPlanningProvider:
         request: PlanningRequest = self.jobs[provider_job_id]["request"]
         if self.failure_mode == "malformed":
             return PlanningResult.model_validate({"schema_version": "music-video-plan-v1"})
+        if request.project_type == "TOUR_GUIDE":
+            return self._tour_guide_result(request)
         count = min(
             request.maximum_shot_count, max(2, math.ceil(request.target_duration_seconds / 5))
         )
@@ -86,6 +93,72 @@ class MockPlanningProvider:
                 avoid=["logos", "on-screen text"],
             ),
             shots=shots,
+        )
+
+    def _tour_guide_result(self, request: PlanningRequest) -> PlanningResult:
+        count = min(5, max(4, request.maximum_shot_count))
+        base = round(request.target_duration_seconds / count, 2)
+        durations = [base] * count
+        durations[-1] = round(request.target_duration_seconds - sum(durations[:-1]), 2)
+        locations = ["Uvodni naslov", "Kalemegdan", "Knez Mihailova"]
+        if count == 5:
+            locations.append("Skadarlija")
+        locations.append("Završni kadar")
+        scenes = []
+        for index in range(1, count + 1):
+            location = locations[index - 1]
+            claims = []
+            if location == "Kalemegdan":
+                claims = [
+                    {
+                        "claim": "Kalemegdan pruža pogled na ušće Save u Dunav.",
+                        "sources": [],
+                    }
+                ]
+            narration = {
+                "Uvodni naslov": "Beograd iz prvog lica, u nekoliko brzih stanica.",
+                "Kalemegdan": "Počinjemo iznad reka, uz kadar koji traži proveru činjenice.",
+                "Knez Mihailova": "Nastavljamo kroz ritam centralne pešačke ulice.",
+                "Skadarlija": "Kratak prolaz kroz teksture stare gradske četvrti.",
+                "Završni kadar": "Grad ostaje iza nas, a putopis se završava jednim pogledom.",
+            }[location]
+            scenes.append(
+                PlanShot(
+                    item_key=f"scene-{index:03d}",
+                    ordinal=index,
+                    title=location,
+                    description=f"POV scena za motiv: {location}.",
+                    prompt=f"Vertical 9:16 POV travel footage in Belgrade, {location}.",
+                    duration_seconds=durations[index - 1],
+                    shot_type="POV",
+                    camera="handheld forward movement",
+                    subject="Belgrade travel experience",
+                    environment=location,
+                    continuity_notes="Keep movement natural and narration concise.",
+                    location_or_motif=location,
+                    pov_description=f"Vertikalni POV prolazak kroz motiv {location}.",
+                    narration=narration,
+                    factual_claims=claims,
+                )
+            )
+        return PlanningResult(
+            schema_version="tour-guide-plan-v1",
+            concept_title="Beograd iz prvog lica",
+            logline="Kratak vertikalni POV putopis kroz prepoznatljive motive Beograda.",
+            treatment=(
+                "Mock predlog na srpskom povezuje uvodni naslov, gradske scene i završni kadar. "
+                "Tvrdnje bez izvora moraju biti proverene pre odobrenja."
+            ),
+            creative_direction=CreativeDirection(
+                visual_style="autentičan vertikalni video putopis",
+                color_palette=["kamen", "zelenilo", "gradska svetla"],
+                camera_language="POV kretanje u formatu 9:16",
+                editing_rhythm="kratke scene sa jasnim prelazima",
+                performance_direction="naracija na srpskom, bez voditelja u kadru",
+                continuity_notes=["Dosledan POV", "Kratka naracija po sceni"],
+                avoid=["neproverene činjenice", "izmišljeni izvori"],
+            ),
+            shots=scenes,
         )
 
     def cancel(self, provider_job_id: str) -> GenerationStatus:

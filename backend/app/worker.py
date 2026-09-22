@@ -532,6 +532,7 @@ def _process_planning(job_id: str) -> None:
             target_duration=request.target_duration_seconds,
             maximum_shots=request.maximum_shot_count,
             allowed_asset_ids=allowed_assets,
+            require_verified_sources=False,
         )
         if settings.planning_provider == "openai" and not persisted_response:
             assert evidence is not None and reserved is not None
