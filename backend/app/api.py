@@ -4,22 +4,28 @@ import json
 import math
 from datetime import datetime
 from pathlib import PurePath
-from typing import Any
-from uuid import UUID
+from typing import Any, Literal
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
+from psycopg import Error as PsycopgError
 from psycopg.types.json import Jsonb
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from backend.app.config import settings
 from backend.app.db import connection
 from backend.app.domain.models import JobStatus
 from backend.app.domain.planning import PlanningRequest, PlanningResult, validate_plan
 from backend.app.queue import enqueue
-from backend.app.render import probe_duration
+from backend.app.render import probe_audio, probe_duration, probe_video
+from backend.app.services.tour_render import (
+    TourRenderReadinessError,
+    build_tour_snapshot,
+    file_checksum,
+)
 from backend.app.storage.local import LocalStorage
 
 app = FastAPI(title="Hype AI Studio")
@@ -32,10 +38,19 @@ app.add_middleware(
 
 
 class ProjectCreate(BaseModel):
-    project_type: str = "MUSIC_VIDEO"
-    title: str
-    creative_brief: str = ""
+    project_type: Literal["MUSIC_VIDEO", "TOUR_GUIDE"] = "MUSIC_VIDEO"
+    title: str = Field(min_length=2, max_length=120)
+    creative_brief: str = Field(default="", max_length=2000)
     aspect_ratio: str = "16:9"
+
+    @model_validator(mode="after")
+    def validate_project_format(self):
+        if self.project_type == "TOUR_GUIDE":
+            if self.aspect_ratio != "9:16":
+                raise ValueError("tour guide projects require a 9:16 aspect ratio")
+            if len(self.creative_brief.strip()) < 20:
+                raise ValueError("tour guide brief must contain at least 20 characters")
+        return self
 
 
 class ShotCreate(BaseModel):
@@ -86,6 +101,19 @@ class RenderCreate(BaseModel):
     outro_card: OutroCard | None = None
 
 
+class TourRenderCreate(BaseModel):
+    opening_title: str = Field(min_length=1, max_length=160)
+    closing_title: str = Field(min_length=1, max_length=160)
+    music_asset_id: UUID | None = None
+
+    @field_validator("opening_title", "closing_title")
+    @classmethod
+    def title_required(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("tour title must not be blank")
+        return value
+
+
 class PlanGenerate(BaseModel):
     target_duration_seconds: float = Field(gt=0, le=600)
     visual_tone: str = Field(min_length=1)
@@ -114,6 +142,13 @@ class PlanSummary(BaseModel):
 
 
 class PlanApprovalResponse(BaseModel):
+    plan_id: UUID
+    status: str
+    created_shot_ids: list[UUID]
+    idempotent: bool
+
+
+class PlanHandoffResponse(BaseModel):
     plan_id: UUID
     status: str
     created_shot_ids: list[UUID]
@@ -167,7 +202,7 @@ def list_projects():
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
             "SELECT id,project_type,title,creative_brief,aspect_ratio,status,created_at,updated_at "
-            "FROM projects WHERE project_type='MUSIC_VIDEO' ORDER BY updated_at DESC,created_at DESC"
+            "FROM projects ORDER BY updated_at DESC,created_at DESC"
         )
         rows = cursor.fetchall()
     fields = (
@@ -246,6 +281,8 @@ def upload_asset(
     asset_type: str = Form("AUDIO"),
     rights_metadata: str = Form("{}"),
 ):
+    if asset_type not in {"AUDIO", "REFERENCE_IMAGE"}:
+        raise HTTPException(422, "asset_type must be AUDIO or REFERENCE_IMAGE")
     filename = file.filename or ""
     if not filename or PurePath(filename).name != filename:
         raise HTTPException(400, "unsafe or missing filename")
@@ -299,8 +336,13 @@ def list_assets(project_id: UUID):
         if cursor.fetchone() is None:
             raise HTTPException(404, "project not found")
         cursor.execute(
-            "SELECT id,asset_type,storage_key,mime_type,size_bytes,checksum,rights_metadata,created_at "
-            "FROM assets WHERE project_id=%s ORDER BY created_at",
+            "SELECT a.id,a.asset_type,a.storage_key,a.mime_type,a.size_bytes,a.checksum,"
+            "a.rights_metadata,a.created_at,a.shot_id,a.source_plan_id,a.source_plan_version,"
+            "a.source_plan_item_key,a.narration_checksum,a.media_duration,s.source_plan_id,"
+            "s.source_plan_version,s.source_plan_item_key,s.source_narration,p.status "
+            "FROM assets a LEFT JOIN shots s ON s.id=a.shot_id "
+            "LEFT JOIN project_plans p ON p.id=s.source_plan_id "
+            "WHERE a.project_id=%s ORDER BY a.created_at",
             (project_id,),
         )
         rows = cursor.fetchall()
@@ -308,12 +350,40 @@ def list_assets(project_id: UUID):
         {
             "id": str(row[0]),
             "asset_type": row[1],
-            "filename": PurePath(row[2]).name,
+            "filename": (
+                row[6].get("original_filename", PurePath(row[2]).name)
+                if row[1] == "TOUR_FOOTAGE"
+                else PurePath(row[2]).name
+            ),
             "mime_type": row[3],
             "size_bytes": row[4],
             "checksum": row[5],
             "rights_metadata": row[6],
             "created_at": row[7],
+            "shot_id": str(row[8]) if row[8] else None,
+            "source_plan_id": str(row[9]) if row[9] else None,
+            "source_plan_version": row[10],
+            "source_plan_item_key": row[11],
+            "narration_checksum": row[12],
+            "media_duration": float(row[13]) if row[13] is not None else None,
+            "provenance_current": (
+                True
+                if row[1] not in {"VOICEOVER", "TOUR_FOOTAGE"}
+                else bool(
+                    row[14] == row[9]
+                    and row[15] == row[10]
+                    and row[16] == row[11]
+                    and row[18] == "APPROVED"
+                    and (
+                        row[1] == "TOUR_FOOTAGE"
+                        or (
+                            row[17]
+                            and row[12]
+                            == hashlib.sha256(row[17].encode("utf-8")).hexdigest()
+                        )
+                    )
+                )
+            ),
         }
         for row in rows
     ]
@@ -327,6 +397,376 @@ def get_asset_media(asset_id: UUID, download: bool = Query(False)):
     if row is None:
         raise HTTPException(404, "asset not found")
     return media_response(row[0], row[1], download)
+
+
+@app.post("/shots/{shot_id}/voiceover", status_code=201)
+def upload_tour_voiceover(shot_id: UUID, file: UploadFile = File(...)):  # noqa: B008
+    filename = file.filename or ""
+    if not filename or PurePath(filename).name != filename:
+        raise HTTPException(400, "unsafe or missing filename")
+    declared_mime = file.content_type or "application/octet-stream"
+    if declared_mime not in {
+        "audio/wav",
+        "audio/x-wav",
+        "audio/mpeg",
+        "audio/ogg",
+        "audio/mp4",
+        "audio/x-m4a",
+    }:
+        raise HTTPException(422, "voiceover must be WAV, MP3, OGG, M4A, or MP4 audio")
+    data = file.file.read(settings.max_asset_upload_bytes + 1)
+    if not data:
+        raise HTTPException(400, "uploaded file is empty")
+    if len(data) > settings.max_asset_upload_bytes:
+        raise HTTPException(413, "uploaded file exceeds the size limit")
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT s.project_id,p.project_type,s.source_plan_id,s.source_plan_version,"
+            "s.source_plan_item_key,s.source_narration,pp.status,pp.version,pp.materialized_at "
+            "FROM shots s JOIN projects p ON p.id=s.project_id "
+            "LEFT JOIN project_plans pp ON pp.id=s.source_plan_id WHERE s.id=%s",
+            (shot_id,),
+        )
+        shot = cursor.fetchone()
+        if shot is None:
+            raise HTTPException(404, "shot not found")
+        if shot[1] != "TOUR_GUIDE":
+            raise HTTPException(422, "voiceover upload is available only for tour guide shots")
+        if (
+            not shot[2]
+            or not shot[3]
+            or not shot[4]
+            or not shot[5]
+            or shot[6] != "APPROVED"
+            or shot[7] != shot[3]
+            or shot[8] is None
+        ):
+            raise HTTPException(409, "tour guide shot narration provenance is not current")
+        checksum = hashlib.sha256(data).hexdigest()
+        narration_checksum = hashlib.sha256(shot[5].encode("utf-8")).hexdigest()
+        key = f"projects/{shot[0]}/voiceovers/{shot_id}/{checksum}-{filename}"
+        storage = LocalStorage(settings.storage_root)
+        storage.save(key, data)
+        try:
+            duration, detected_format = probe_audio(storage.path(key))
+        except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            storage.delete(key)
+            raise HTTPException(422, str(exc)) from exc
+        detected_mime = {
+            "wav": "audio/wav",
+            "mp3": "audio/mpeg",
+            "ogg": "audio/ogg",
+            "mov": "audio/mp4",
+        }[detected_format]
+        cursor.execute(
+            "SELECT storage_key FROM assets WHERE shot_id=%s AND asset_type='VOICEOVER'",
+            (shot_id,),
+        )
+        prior = cursor.fetchone()
+        cursor.execute(
+            "INSERT INTO assets(project_id,asset_type,storage_key,mime_type,size_bytes,checksum,"
+            "rights_metadata,shot_id,source_plan_id,source_plan_version,source_plan_item_key,"
+            "narration_checksum,media_duration) "
+            "VALUES (%s,'VOICEOVER',%s,%s,%s,%s,'{}',%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (shot_id) WHERE asset_type='VOICEOVER' DO UPDATE SET "
+            "storage_key=EXCLUDED.storage_key,mime_type=EXCLUDED.mime_type,"
+            "size_bytes=EXCLUDED.size_bytes,checksum=EXCLUDED.checksum,"
+            "source_plan_id=EXCLUDED.source_plan_id,source_plan_version=EXCLUDED.source_plan_version,"
+            "source_plan_item_key=EXCLUDED.source_plan_item_key,"
+            "narration_checksum=EXCLUDED.narration_checksum,media_duration=EXCLUDED.media_duration,"
+            "created_at=now() RETURNING id",
+            (
+                shot[0],
+                key,
+                detected_mime,
+                len(data),
+                checksum,
+                shot_id,
+                shot[2],
+                shot[3],
+                shot[4],
+                narration_checksum,
+                duration,
+            ),
+        )
+        asset_id = cursor.fetchone()[0]
+        record_event(
+            cursor,
+            shot[0],
+            "TOUR_VOICEOVER_UPLOADED",
+            "asset",
+            asset_id,
+            {"shot_id": str(shot_id), "duration": duration, "replaced": bool(prior)},
+        )
+        conn.commit()
+    if prior and prior[0] != key:
+        storage.delete(prior[0])
+    return {
+        "id": str(asset_id),
+        "shot_id": str(shot_id),
+        "duration": duration,
+        "mime_type": detected_mime,
+    }
+
+
+@app.post("/shots/{shot_id}/footage", status_code=202)
+def upload_tour_footage(
+    shot_id: UUID,
+    idempotency_key: str = Form(...),
+    rights_metadata: str = Form(...),
+    file: UploadFile = File(...),  # noqa: B008
+):
+    filename = file.filename or ""
+    if (
+        not filename
+        or PurePath(filename).name != filename
+        or "\\" in filename
+        or len(filename.encode("utf-8")) > 200
+        or any(ord(character) < 32 for character in filename)
+    ):
+        raise HTTPException(400, "unsafe or missing filename")
+    if not idempotency_key.strip() or len(idempotency_key) > 200:
+        raise HTTPException(422, "idempotency key must contain 1 to 200 characters")
+    try:
+        rights = json.loads(rights_metadata)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(422, "rights metadata must be valid JSON") from exc
+    if not isinstance(rights, dict):
+        raise HTTPException(422, "rights metadata must be a JSON object")
+    if not str(rights.get("source", "")).strip() or not str(rights.get("license", "")).strip():
+        raise HTTPException(422, "footage source and licence are required")
+    if rights.get("usage_confirmed") is not True:
+        raise HTTPException(422, "footage usage rights must be confirmed")
+    if rights.get("depicts_real_person") is True and rights.get("likeness_consent_confirmed") is not True:
+        raise HTTPException(422, "likeness consent must be confirmed for depicted people")
+    data = file.file.read(settings.max_asset_upload_bytes + 1)
+    if not data:
+        raise HTTPException(400, "uploaded file is empty")
+    if len(data) > settings.max_asset_upload_bytes:
+        raise HTTPException(413, "uploaded file exceeds the size limit")
+    checksum = hashlib.sha256(data).hexdigest()
+    storage = LocalStorage(settings.storage_root)
+    temporary_key = f"footage-validation/{uuid4()}"
+    storage.save(temporary_key, data)
+    try:
+        media = probe_video(storage.path(temporary_key))
+    except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    finally:
+        storage.delete(temporary_key)
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT s.project_id,p.project_type,s.source_plan_id,s.source_plan_version,"
+            "s.source_plan_item_key,s.source_scene_duration,pp.status,pp.version,pp.materialized_at "
+            "FROM shots s JOIN projects p ON p.id=s.project_id "
+            "LEFT JOIN project_plans pp ON pp.id=s.source_plan_id WHERE s.id=%s FOR UPDATE OF s",
+            (shot_id,),
+        )
+        shot = cursor.fetchone()
+        if shot is None:
+            raise HTTPException(404, "shot not found")
+        if shot[1] != "TOUR_GUIDE":
+            raise HTTPException(422, "footage import is available only for tour guide shots")
+        if not shot[2] or not shot[3] or not shot[4] or shot[6] != "APPROVED" or shot[7] != shot[3] or shot[8] is None:
+            raise HTTPException(409, "tour guide shot provenance is not current")
+        if media["duration"] + 0.01 < float(shot[5]):
+            raise HTTPException(422, "footage is shorter than the approved scene duration")
+        request_data = {
+            "origin": "producer_upload",
+            "original_checksum": checksum,
+            "original_duration": media["duration"],
+            "original_width": media["width"],
+            "original_height": media["height"],
+            "original_codec": media["codec"],
+            "original_container": media["container"],
+            "trim_start_seconds": 0,
+            "target_duration": float(shot[5]),
+            "tour_provenance": {"source_plan_id": str(shot[2]), "source_plan_version": shot[3], "source_plan_item_key": shot[4]},
+        }
+        cursor.execute("SELECT id,status,shot_id,request_data FROM jobs WHERE idempotency_key=%s", (idempotency_key,))
+        existing = cursor.fetchone()
+        if existing:
+            prior = existing[3] or {}
+            if (
+                existing[2] != shot_id
+                or prior.get("original_checksum") != checksum
+                or prior.get("tour_provenance") != request_data["tour_provenance"]
+                or prior.get("target_duration") != request_data["target_duration"]
+            ):
+                raise HTTPException(409, "idempotency key belongs to another footage upload")
+            if existing[1] == "QUEUED":
+                enqueue(str(existing[0]), "footage")
+            return {"job_id": str(existing[0]), "status": existing[1], "deduplicated": True, "asset_id": prior.get("original_asset_id")}
+        original_key = f"projects/{shot[0]}/footage/{shot_id}/{uuid4()}.source"
+        storage.save(original_key, data)
+        try:
+            cursor.execute(
+                "INSERT INTO assets(project_id,asset_type,storage_key,mime_type,size_bytes,checksum,rights_metadata,shot_id,source_plan_id,source_plan_version,source_plan_item_key,media_duration) "
+                "VALUES (%s,'TOUR_FOOTAGE',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                (shot[0], original_key, {"mp4": "video/mp4", "mov": "video/quicktime", "webm": "video/webm", "matroska": "video/x-matroska"}[media["container"]], len(data), checksum, Jsonb({**rights, "original_filename": filename}), shot_id, shot[2], shot[3], shot[4], media["duration"]),
+            )
+            asset_id = cursor.fetchone()[0]
+            request_data["original_asset_id"] = str(asset_id)
+            request_data["original_key"] = original_key
+            cursor.execute(
+                "INSERT INTO jobs(project_id,shot_id,job_type,status,idempotency_key,max_retries,request_data) "
+                "VALUES (%s,%s,'FOOTAGE_IMPORT','QUEUED',%s,0,%s) RETURNING id",
+                (shot[0], shot_id, idempotency_key, Jsonb(request_data)),
+            )
+            job_id = cursor.fetchone()[0]
+            record_event(cursor, shot[0], "TOUR_FOOTAGE_UPLOADED", "asset", asset_id, {"shot_id": str(shot_id), "job_id": str(job_id), "checksum": checksum, "trim_start_seconds": 0})
+            conn.commit()
+        except Exception:
+            storage.delete(original_key)
+            raise
+    try:
+        enqueue(str(job_id), "footage")
+    except Exception as exc:
+        raise HTTPException(
+            503,
+            "footage was stored but queueing failed; repeat the same idempotent request",
+        ) from exc
+    return {"job_id": str(job_id), "status": "QUEUED", "deduplicated": False, "asset_id": str(asset_id)}
+
+
+@app.post("/projects/{project_id}/tour-music", status_code=201)
+def upload_tour_music(
+    project_id: UUID,
+    file: UploadFile = File(...),  # noqa: B008
+    rights_metadata: str = Form(...),
+):
+    filename = file.filename or ""
+    if not filename or PurePath(filename).name != filename:
+        raise HTTPException(400, "unsafe or missing filename")
+    try:
+        rights = json.loads(rights_metadata)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(422, "rights metadata must be valid JSON") from exc
+    if not isinstance(rights, dict) or rights.get("usage_confirmed") is not True:
+        raise HTTPException(422, "music usage rights must be confirmed")
+    data = file.file.read(settings.max_asset_upload_bytes + 1)
+    if not data:
+        raise HTTPException(400, "uploaded file is empty")
+    if len(data) > settings.max_asset_upload_bytes:
+        raise HTTPException(413, "uploaded file exceeds the size limit")
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT project_type FROM projects WHERE id=%s FOR UPDATE", (project_id,))
+        project = cursor.fetchone()
+        if project is None:
+            raise HTTPException(404, "project not found")
+        if project[0] != "TOUR_GUIDE":
+            raise HTTPException(422, "tour music is available only for tour guide projects")
+        checksum = hashlib.sha256(data).hexdigest()
+        key = f"projects/{project_id}/tour-music/{checksum}-{filename}"
+        storage = LocalStorage(settings.storage_root)
+        storage.save(key, data)
+        try:
+            duration, detected_format = probe_audio(storage.path(key))
+        except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            storage.delete(key)
+            raise HTTPException(422, str(exc)) from exc
+        detected_mime = {
+            "wav": "audio/wav",
+            "mp3": "audio/mpeg",
+            "ogg": "audio/ogg",
+            "mov": "audio/mp4",
+        }[detected_format]
+        cursor.execute(
+            "SELECT id,storage_key FROM assets WHERE project_id=%s AND asset_type='TOUR_MUSIC'",
+            (project_id,),
+        )
+        prior = cursor.fetchone()
+        if prior:
+            cursor.execute(
+                "UPDATE assets SET storage_key=%s,mime_type=%s,size_bytes=%s,checksum=%s,rights_metadata=%s,media_duration=%s,created_at=now() WHERE id=%s RETURNING id",
+                (key, detected_mime, len(data), checksum, Jsonb(rights), duration, prior[0]),
+            )
+        else:
+            cursor.execute(
+                "INSERT INTO assets(project_id,asset_type,storage_key,mime_type,size_bytes,checksum,rights_metadata,media_duration) VALUES (%s,'TOUR_MUSIC',%s,%s,%s,%s,%s,%s) RETURNING id",
+                (project_id, key, detected_mime, len(data), checksum, Jsonb(rights), duration),
+            )
+        asset_id = cursor.fetchone()[0]
+        record_event(
+            cursor,
+            project_id,
+            "TOUR_MUSIC_UPLOADED",
+            "asset",
+            asset_id,
+            {"duration": duration, "replaced": bool(prior)},
+        )
+        conn.commit()
+    if prior and prior[1] != key:
+        storage.delete(prior[1])
+    return {"id": str(asset_id), "duration": duration, "mime_type": detected_mime}
+
+
+@app.get("/projects/{project_id}/tour-timeline")
+def tour_timeline(project_id: UUID):
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT project_type FROM projects WHERE id=%s", (project_id,))
+        project = cursor.fetchone()
+        if project is None:
+            raise HTTPException(404, "project not found")
+        if project[0] != "TOUR_GUIDE":
+            raise HTTPException(422, "timeline is available only for tour guide projects")
+        cursor.execute(
+            "SELECT s.id,s.ordinal,s.title,s.source_scene_duration,s.selected_variant_id,"
+            "s.source_plan_id,s.source_plan_version,s.source_plan_item_key,s.source_narration,"
+            "p.status,a.id,a.source_plan_id,a.source_plan_version,a.source_plan_item_key,"
+            "a.narration_checksum,a.media_duration "
+            "FROM shots s LEFT JOIN project_plans p ON p.id=s.source_plan_id "
+            "LEFT JOIN assets a ON a.shot_id=s.id AND a.asset_type='VOICEOVER' "
+            "WHERE s.project_id=%s ORDER BY s.ordinal",
+            (project_id,),
+        )
+        rows = cursor.fetchall()
+    items = []
+    timeline_offset = 0.0
+    for row in rows:
+        expected_checksum = hashlib.sha256(row[8].encode("utf-8")).hexdigest() if row[8] else None
+        current = bool(
+            row[9] == "APPROVED"
+            and row[10]
+            and row[11] == row[5]
+            and row[12] == row[6]
+            and row[13] == row[7]
+            and row[14] == expected_checksum
+        )
+        duration = float(row[15]) if row[15] is not None else None
+        shot_duration = float(row[3]) if row[3] is not None else 0
+        status = (
+            "MISSING"
+            if row[10] is None
+            else "STALE"
+            if not current
+            else "TOO_LONG"
+            if duration is not None and duration > shot_duration + 0.01
+            else "READY"
+        )
+        items.append(
+            {
+                "shot_id": str(row[0]),
+                "ordinal": row[1],
+                "title": row[2],
+                "shot_duration": shot_duration,
+                "start_seconds": timeline_offset,
+                "end_seconds": timeline_offset + shot_duration,
+                "selected_variant_id": str(row[4]) if row[4] else None,
+                "narration": row[8],
+                "voiceover_asset_id": str(row[10]) if row[10] else None,
+                "voiceover_duration": duration,
+                "voiceover_status": status,
+                "ready": bool(row[4]) and status == "READY",
+            }
+        )
+        timeline_offset += shot_duration
+    return {
+        "items": items,
+        "total_duration": timeline_offset,
+        "ready": bool(items) and all(item["ready"] for item in items),
+        "next_render_requirements": ["opening title", "closing title", "music bed"],
+    }
 
 
 @app.post("/projects/{project_id}/shots", status_code=201)
@@ -349,7 +789,9 @@ def list_shots(project_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
             "SELECT s.id,s.ordinal,s.title,s.prompt,s.intended_duration,s.status,s.selected_variant_id,"
-            "s.source_plan_id,s.source_plan_item_key,"
+            "s.source_plan_id,s.source_plan_item_key,s.source_plan_version,s.source_scene_duration,"
+            "s.source_location_or_motif,s.source_pov_description,s.source_narration,"
+            "s.source_factual_claims,"
             "j.id,j.status FROM shots s LEFT JOIN LATERAL "
             "(SELECT id,status FROM jobs WHERE shot_id=s.id ORDER BY created_at DESC LIMIT 1) j ON true "
             "WHERE s.project_id=%s ORDER BY s.ordinal",
@@ -367,8 +809,14 @@ def list_shots(project_id: UUID):
             "selected_variant_id": str(row[6]) if row[6] else None,
             "source_plan_id": str(row[7]) if row[7] else None,
             "source_plan_item_key": row[8],
-            "latest_job_id": str(row[9]) if row[9] else None,
-            "latest_job_status": row[10],
+            "source_plan_version": row[9],
+            "source_scene_duration": float(row[10]) if row[10] is not None else None,
+            "source_location_or_motif": row[11],
+            "source_pov_description": row[12],
+            "source_narration": row[13],
+            "source_factual_claims": row[14],
+            "latest_job_id": str(row[15]) if row[15] else None,
+            "latest_job_status": row[16],
         }
         for row in rows
     ]
@@ -377,6 +825,15 @@ def list_shots(project_id: UUID):
 @app.put("/shots/{shot_id}")
 def update_shot(shot_id: UUID, body: ShotUpdate):
     with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT p.project_type FROM shots s JOIN projects p ON p.id=s.project_id WHERE s.id=%s",
+            (shot_id,),
+        )
+        project = cursor.fetchone()
+        if project is None:
+            raise HTTPException(404, "shot not found")
+        if project[0] == "TOUR_GUIDE":
+            raise HTTPException(409, "approved tour shots are immutable")
         cursor.execute(
             "UPDATE shots SET ordinal=%s,title=%s,prompt=%s,intended_duration=%s,updated_at=now() "
             "WHERE id=%s RETURNING id",
@@ -391,6 +848,12 @@ def update_shot(shot_id: UUID, body: ShotUpdate):
 @app.put("/projects/{project_id}/shots/order")
 def reorder_shots(project_id: UUID, body: ShotOrder):
     with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT project_type FROM projects WHERE id=%s", (project_id,))
+        project = cursor.fetchone()
+        if project is None:
+            raise HTTPException(404, "project not found")
+        if project[0] == "TOUR_GUIDE":
+            raise HTTPException(409, "approved tour shot order is immutable")
         cursor.execute(
             "SELECT id FROM shots WHERE project_id=%s ORDER BY ordinal FOR UPDATE", (project_id,)
         )
@@ -409,12 +872,65 @@ def reorder_shots(project_id: UUID, body: ShotOrder):
 @app.post("/shots/{shot_id}/generations", status_code=202)
 def submit_generation(shot_id: UUID, idempotency_key: str, reference_asset_id: UUID | None = None):
     with connection() as conn, conn.cursor() as cursor:
-        cursor.execute("SELECT id,project_id FROM shots WHERE id=%s", (shot_id,))
+        cursor.execute(
+            "SELECT s.id,s.project_id,p.project_type,s.source_plan_id,s.source_plan_item_key,"
+            "s.source_plan_version,s.source_scene_duration,s.source_location_or_motif,"
+            "s.source_pov_description,s.source_narration,s.source_factual_claims,pp.status,"
+            "pp.version,pp.materialized_at,pp.shot_plan FROM shots s "
+            "JOIN projects p ON p.id=s.project_id LEFT JOIN project_plans pp ON pp.id=s.source_plan_id "
+            "WHERE s.id=%s",
+            (shot_id,),
+        )
         shot = cursor.fetchone()
         if not shot:
             raise HTTPException(404, "shot not found")
         request_data: dict[str, Any] = {}
+        if shot[2] == "TOUR_GUIDE":
+            if settings.video_provider != "mock":
+                raise HTTPException(422, "tour guide shots support mock generation only")
+            if not all(shot[index] is not None for index in range(3, 11)):
+                raise HTTPException(409, "tour guide shot provenance is incomplete")
+            if shot[11] != "APPROVED" or shot[13] is None or shot[12] != shot[5]:
+                raise HTTPException(409, "tour guide shot is not from the current approved plan")
+            claims = shot[10] or []
+            if any(
+                not claim.get("sources")
+                or any(
+                    not source.startswith(("https://", "http://"))
+                    for source in claim.get("sources", [])
+                )
+                for claim in claims
+            ):
+                raise HTTPException(409, "tour guide shot has unverified factual claims")
+            source_scene = next(
+                (scene for scene in (shot[14] or []) if scene.get("item_key") == shot[4]), None
+            )
+            expected = (
+                shot[5],
+                float(shot[6]),
+                shot[7],
+                shot[8],
+                shot[9],
+                claims,
+            )
+            persisted = (
+                shot[12],
+                float(source_scene["duration_seconds"]) if source_scene else None,
+                source_scene.get("location_or_motif") if source_scene else None,
+                source_scene.get("pov_description") if source_scene else None,
+                source_scene.get("narration") if source_scene else None,
+                source_scene.get("factual_claims", []) if source_scene else None,
+            )
+            if source_scene is None or expected != persisted:
+                raise HTTPException(409, "tour guide shot provenance does not match approved plan")
+            request_data["tour_provenance"] = {
+                "source_plan_id": str(shot[3]),
+                "source_plan_version": shot[5],
+                "source_plan_item_key": shot[4],
+            }
         if reference_asset_id:
+            if shot[2] == "TOUR_GUIDE":
+                raise HTTPException(422, "tour guide mock generation does not accept references")
             cursor.execute(
                 "SELECT project_id,asset_type,storage_key,mime_type,size_bytes,checksum,rights_metadata "
                 "FROM assets WHERE id=%s",
@@ -556,6 +1072,7 @@ def variants(shot_id: UUID):
             "attempt_number": r[7],
             "job_id": str(r[8]),
             "provenance": r[9],
+            "plan_provenance": (r[9] or {}).get("tour_provenance"),
             "provider": r[10],
             "model": r[11],
             "generation_mode": (
@@ -571,12 +1088,63 @@ def variants(shot_id: UUID):
 def select_variant(shot_id: UUID, variant_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
-            "SELECT project_id FROM shots WHERE id=%s AND EXISTS (SELECT 1 FROM shot_variants WHERE id=%s AND shot_id=%s)",
-            (shot_id, variant_id, shot_id),
+            "SELECT s.project_id,p.project_type,s.source_plan_id,s.source_plan_version,"
+            "s.source_plan_item_key,pp.status,pp.materialized_at,ga.parameters,s.source_scene_duration "
+            "FROM shots s JOIN projects p ON p.id=s.project_id "
+            "JOIN shot_variants v ON v.shot_id=s.id AND v.id=%s "
+            "JOIN generation_attempts ga ON ga.id=v.generation_attempt_id "
+            "LEFT JOIN project_plans pp ON pp.id=s.source_plan_id WHERE s.id=%s FOR UPDATE OF s",
+            (variant_id, shot_id),
         )
         project = cursor.fetchone()
         if not project:
             raise HTTPException(404, "variant not found")
+        if project[1] == "TOUR_GUIDE":
+            expected = {
+                "source_plan_id": str(project[2]),
+                "source_plan_version": project[3],
+                "source_plan_item_key": project[4],
+            }
+            if (
+                project[5] != "APPROVED"
+                or project[6] is None
+                or (project[7] or {}).get("tour_provenance") != expected
+                or (
+                    (project[7] or {}).get("origin") == "producer_upload"
+                    and (
+                        (project[7] or {}).get("target_duration") is None
+                        or abs(
+                            float((project[7] or {})["target_duration"])
+                            - float(project[8])
+                        )
+                        > 0.01
+                    )
+                )
+            ):
+                raise HTTPException(409, "tour guide variant provenance is no longer current")
+            parameters = project[7] or {}
+            if parameters.get("origin") == "producer_upload":
+                cursor.execute(
+                    "SELECT storage_key,checksum,source_plan_id,source_plan_version,"
+                    "source_plan_item_key FROM assets WHERE id=%s AND project_id=%s "
+                    "AND shot_id=%s AND asset_type='TOUR_FOOTAGE'",
+                    (parameters.get("original_asset_id"), project[0], shot_id),
+                )
+                original = cursor.fetchone()
+                if (
+                    not original
+                    or original[1] != parameters.get("original_checksum")
+                    or (str(original[2]), original[3], original[4])
+                    != (
+                        expected["source_plan_id"],
+                        expected["source_plan_version"],
+                        expected["source_plan_item_key"],
+                    )
+                    or not LocalStorage(settings.storage_root).exists(original[0])
+                    or file_checksum(LocalStorage(settings.storage_root).path(original[0]))
+                    != original[1]
+                ):
+                    raise HTTPException(409, "producer footage original is no longer current")
         cursor.execute(
             "UPDATE shot_variants SET review_status='SUPERSEDED' WHERE shot_id=%s AND review_status='SELECTED'",
             (shot_id,),
@@ -658,12 +1226,19 @@ _PLAN_COLUMNS = (
 def generate_plan(project_id: UUID, body: PlanGenerate):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
-            "SELECT creative_brief,aspect_ratio,title FROM projects WHERE id=%s AND project_type='MUSIC_VIDEO'",
+            "SELECT creative_brief,aspect_ratio,title,project_type FROM projects WHERE id=%s",
             (project_id,),
         )
         project = cursor.fetchone()
         if project is None:
-            raise HTTPException(404, "music video project not found")
+            raise HTTPException(404, "project not found")
+        if project[3] == "TOUR_GUIDE":
+            if settings.planning_provider != "mock":
+                raise HTTPException(422, "tour guide planning supports the mock provider only")
+            if not 30 <= body.target_duration_seconds <= 45:
+                raise HTTPException(422, "tour guide duration must be between 30 and 45 seconds")
+            if not 4 <= body.maximum_shot_count <= 5:
+                raise HTTPException(422, "tour guide plans require 4 or 5 scenes")
         assets = []
         if body.use_reference_assets:
             cursor.execute(
@@ -682,7 +1257,7 @@ def generate_plan(project_id: UUID, body: PlanGenerate):
             ]
         request = PlanningRequest(
             project_id=str(project_id),
-            project_type="MUSIC_VIDEO",
+            project_type=project[3],
             project_title=project[2],
             creative_brief=project[0],
             target_duration_seconds=body.target_duration_seconds,
@@ -722,11 +1297,9 @@ def generate_plan(project_id: UUID, body: PlanGenerate):
 @app.get("/projects/{project_id}/plans", response_model=list[PlanSummary])
 def list_plans(project_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
-        cursor.execute(
-            "SELECT 1 FROM projects WHERE id=%s AND project_type='MUSIC_VIDEO'", (project_id,)
-        )
+        cursor.execute("SELECT 1 FROM projects WHERE id=%s", (project_id,))
         if cursor.fetchone() is None:
-            raise HTTPException(404, "music video project not found")
+            raise HTTPException(404, "project not found")
         cursor.execute(
             "SELECT id,version,status,concept_title,provider,model,created_at,approved_at FROM project_plans WHERE project_id=%s ORDER BY version DESC",
             (project_id,),
@@ -787,6 +1360,13 @@ def create_plan_version(project_id: UUID, plan_id: UUID, body: PlanVersionCreate
         if parent is None:
             raise HTTPException(404, "plan not found")
         inputs = parent[5]
+        expected_schema = (
+            "tour-guide-plan-v1"
+            if inputs.get("project_type") == "TOUR_GUIDE"
+            else "music-video-plan-v1"
+        )
+        if body.schema_version != expected_schema:
+            raise HTTPException(422, "plan schema does not match project type")
         cursor.execute("SELECT id FROM assets WHERE project_id=%s", (project_id,))
         allowed = {str(row[0]) for row in cursor.fetchall()}
         try:
@@ -795,6 +1375,7 @@ def create_plan_version(project_id: UUID, plan_id: UUID, body: PlanVersionCreate
                 target_duration=float(inputs["target_duration_seconds"]),
                 maximum_shots=int(inputs["maximum_shot_count"]),
                 allowed_asset_ids=allowed,
+                require_verified_sources=False,
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
@@ -843,6 +1424,7 @@ def approve_plan(project_id: UUID, plan_id: UUID):
         if row is None:
             raise HTTPException(404, "plan not found")
         detail = _plan_detail(row)
+        project_type = detail["planning_inputs"].get("project_type", "MUSIC_VIDEO")
         try:
             result = PlanningResult.model_validate(
                 {
@@ -872,7 +1454,7 @@ def approve_plan(project_id: UUID, plan_id: UUID):
             raise HTTPException(422, str(exc)) from exc
         cursor.execute("SELECT id FROM shots WHERE source_plan_id=%s ORDER BY ordinal", (plan_id,))
         existing = [item[0] for item in cursor.fetchall()]
-        if row[3] == "APPROVED" and row[17] is not None:
+        if row[3] == "APPROVED":
             conn.commit()
             return PlanApprovalResponse(
                 plan_id=plan_id, status="APPROVED", created_shot_ids=existing, idempotent=True
@@ -882,7 +1464,7 @@ def approve_plan(project_id: UUID, plan_id: UUID):
             (project_id, plan_id),
         )
         prior = cursor.fetchone()
-        if prior:
+        if prior and project_type == "MUSIC_VIDEO":
             cursor.execute(
                 "SELECT count(*) FROM generation_attempts ga JOIN shots s ON s.id=ga.shot_id WHERE s.source_plan_id=%s",
                 (prior[0],),
@@ -920,46 +1502,194 @@ def approve_plan(project_id: UUID, plan_id: UUID):
                 prior[0],
                 {"replacement_plan_id": str(plan_id)},
             )
-        cursor.execute(
-            "SELECT COALESCE(max(ordinal),0) FROM shots WHERE project_id=%s AND source_plan_id IS NULL",
-            (project_id,),
-        )
-        offset = cursor.fetchone()[0]
-        created = []
-        for shot in result.shots:
-            cursor.execute(
-                "INSERT INTO shots(project_id,ordinal,title,prompt,intended_duration,status,source_plan_id,source_plan_item_key) VALUES (%s,%s,%s,%s,%s,'PLANNED',%s,%s) ON CONFLICT (source_plan_id,source_plan_item_key) WHERE source_plan_id IS NOT NULL DO NOTHING RETURNING id",
-                (
-                    project_id,
-                    offset + shot.ordinal,
-                    shot.title,
-                    shot.prompt,
-                    shot.duration_seconds,
-                    plan_id,
-                    shot.item_key,
-                ),
+        elif prior:
+            cursor.execute("UPDATE project_plans SET status='SUPERSEDED' WHERE id=%s", (prior[0],))
+            record_event(
+                cursor,
+                project_id,
+                "PLAN_SUPERSEDED",
+                "project_plan",
+                prior[0],
+                {"replacement_plan_id": str(plan_id)},
             )
-            inserted = cursor.fetchone()
-            if inserted:
-                created.append(inserted[0])
+        created = []
+        if project_type == "MUSIC_VIDEO":
+            cursor.execute(
+                "SELECT COALESCE(max(ordinal),0) FROM shots WHERE project_id=%s AND source_plan_id IS NULL",
+                (project_id,),
+            )
+            offset = cursor.fetchone()[0]
+            for shot in result.shots:
+                cursor.execute(
+                    "INSERT INTO shots(project_id,ordinal,title,prompt,intended_duration,status,source_plan_id,source_plan_item_key) VALUES (%s,%s,%s,%s,%s,'PLANNED',%s,%s) ON CONFLICT (source_plan_id,source_plan_item_key) WHERE source_plan_id IS NOT NULL DO NOTHING RETURNING id",
+                    (
+                        project_id,
+                        offset + shot.ordinal,
+                        shot.title,
+                        shot.prompt,
+                        shot.duration_seconds,
+                        plan_id,
+                        shot.item_key,
+                    ),
+                )
+                inserted = cursor.fetchone()
+                if inserted:
+                    created.append(inserted[0])
         cursor.execute(
-            "UPDATE project_plans SET status='APPROVED',approved_at=now(),materialized_at=now() WHERE id=%s",
-            (plan_id,),
-        )
-        record_event(
-            cursor, project_id, "PLAN_APPROVED", "project_plan", plan_id, {"version": row[2]}
+            "UPDATE project_plans SET status='APPROVED',approved_at=now(),"
+            "materialized_at=CASE WHEN %s THEN now() ELSE NULL END WHERE id=%s",
+            (project_type == "MUSIC_VIDEO", plan_id),
         )
         record_event(
             cursor,
             project_id,
-            "PLAN_SHOTS_MATERIALIZED",
+            "PLAN_APPROVED",
             "project_plan",
             plan_id,
-            {"shot_ids": [str(value) for value in created]},
+            {"version": row[2], "project_type": project_type},
         )
+        if project_type == "MUSIC_VIDEO":
+            record_event(
+                cursor,
+                project_id,
+                "PLAN_SHOTS_MATERIALIZED",
+                "project_plan",
+                plan_id,
+                {"shot_ids": [str(value) for value in created]},
+            )
         conn.commit()
     return PlanApprovalResponse(
         plan_id=plan_id, status="APPROVED", created_shot_ids=created, idempotent=False
+    )
+
+
+@app.post("/projects/{project_id}/plans/{plan_id}/handoff", response_model=PlanHandoffResponse)
+def handoff_tour_plan(project_id: UUID, plan_id: UUID):
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            f"SELECT {_PLAN_COLUMNS} FROM project_plans WHERE id=%s AND project_id=%s FOR UPDATE",
+            (plan_id, project_id),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(404, "plan not found")
+        detail = _plan_detail(row)
+        if detail["planning_inputs"].get("project_type") != "TOUR_GUIDE":
+            raise HTTPException(422, "handoff is available only for tour guide plans")
+        if detail["status"] != "APPROVED":
+            raise HTTPException(409, "tour guide plan must be approved before handoff")
+        try:
+            result = PlanningResult.model_validate(
+                {
+                    "schema_version": detail["schema_version"],
+                    "concept_title": detail["concept_title"],
+                    "logline": detail["logline"],
+                    "treatment": detail["treatment"],
+                    "creative_direction": detail["creative_direction"],
+                    "shots": detail["shots"],
+                }
+            )
+            validate_plan(
+                result,
+                target_duration=float(detail["planning_inputs"]["target_duration_seconds"]),
+                maximum_shots=int(detail["planning_inputs"]["maximum_shot_count"]),
+                allowed_asset_ids=set(),
+            )
+        except (ValidationError, ValueError, KeyError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+        cursor.execute(
+            "SELECT id,source_plan_item_key,source_plan_version,source_scene_duration,"
+            "source_location_or_motif,source_pov_description,source_narration,"
+            "source_factual_claims FROM shots WHERE source_plan_id=%s ORDER BY ordinal",
+            (plan_id,),
+        )
+        existing = cursor.fetchall()
+        if existing:
+            expected = [
+                (
+                    scene.item_key,
+                    detail["version"],
+                    scene.duration_seconds,
+                    scene.location_or_motif,
+                    scene.pov_description,
+                    scene.narration,
+                    [claim.model_dump() for claim in scene.factual_claims],
+                )
+                for scene in result.shots
+            ]
+            persisted = [tuple(item[1:]) for item in existing]
+            if persisted != expected:
+                raise HTTPException(409, "existing handoff is incomplete or inconsistent")
+            conn.commit()
+            return PlanHandoffResponse(
+                plan_id=plan_id,
+                status="MATERIALIZED",
+                created_shot_ids=[item[0] for item in existing],
+                idempotent=True,
+            )
+
+        cursor.execute(
+            "SELECT s.id FROM shots s WHERE s.project_id=%s AND s.source_plan_id IS NOT NULL "
+            "AND s.source_plan_id<>%s",
+            (project_id, plan_id),
+        )
+        prior_shot_ids = [item[0] for item in cursor.fetchall()]
+        if prior_shot_ids:
+            cursor.execute(
+                "SELECT EXISTS(SELECT 1 FROM generation_attempts WHERE shot_id=ANY(%s)) OR "
+                "EXISTS(SELECT 1 FROM shots WHERE id=ANY(%s) AND selected_variant_id IS NOT NULL)",
+                (prior_shot_ids, prior_shot_ids),
+            )
+            if cursor.fetchone()[0]:
+                raise HTTPException(
+                    409, "existing production shots have generation or producer review history"
+                )
+            cursor.execute("DELETE FROM shots WHERE id=ANY(%s)", (prior_shot_ids,))
+
+        created: list[UUID] = []
+        try:
+            for scene in result.shots:
+                cursor.execute(
+                    "INSERT INTO shots(project_id,ordinal,title,prompt,intended_duration,status,"
+                    "source_plan_id,source_plan_item_key,source_plan_version,source_scene_duration,"
+                    "source_location_or_motif,"
+                    "source_pov_description,source_narration,source_factual_claims) "
+                    "VALUES (%s,%s,%s,%s,%s,'PLANNED',%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (
+                        project_id,
+                        scene.ordinal,
+                        scene.title,
+                        scene.prompt,
+                        scene.duration_seconds,
+                        plan_id,
+                        scene.item_key,
+                        detail["version"],
+                        scene.duration_seconds,
+                        scene.location_or_motif,
+                        scene.pov_description,
+                        scene.narration,
+                        Jsonb([claim.model_dump() for claim in scene.factual_claims]),
+                    ),
+                )
+                created.append(cursor.fetchone()[0])
+        except PsycopgError as exc:
+            conn.rollback()
+            raise HTTPException(
+                500, "tour plan handoff failed; no production shots were created"
+            ) from exc
+        cursor.execute("UPDATE project_plans SET materialized_at=now() WHERE id=%s", (plan_id,))
+        record_event(
+            cursor,
+            project_id,
+            "TOUR_PLAN_SHOTS_MATERIALIZED",
+            "project_plan",
+            plan_id,
+            {"version": detail["version"], "shot_ids": [str(value) for value in created]},
+        )
+        conn.commit()
+    return PlanHandoffResponse(
+        plan_id=plan_id, status="MATERIALIZED", created_shot_ids=created, idempotent=False
     )
 
 
@@ -986,6 +1716,12 @@ def events(project_id: UUID):
 @app.post("/projects/{project_id}/renders", status_code=202)
 def create_render(project_id: UUID, body: RenderCreate):
     with connection() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT project_type FROM projects WHERE id=%s", (project_id,))
+        project = cursor.fetchone()
+        if project is None:
+            raise HTTPException(404, "project not found")
+        if project[0] == "TOUR_GUIDE":
+            raise HTTPException(422, "tour guide projects require the tour render endpoint")
         cursor.execute(
             "SELECT storage_key FROM assets WHERE id=%s AND project_id=%s AND asset_type='AUDIO'",
             (body.audio_asset_id, project_id),
@@ -1041,6 +1777,85 @@ def create_render(project_id: UUID, body: RenderCreate):
         conn.commit()
     enqueue(str(render_id), "render")
     return {"id": str(render_id), "status": "QUEUED"}
+
+
+@app.post("/projects/{project_id}/tour-renders", status_code=202)
+def create_tour_render(project_id: UUID, body: TourRenderCreate):
+    storage = LocalStorage(settings.storage_root)
+    with connection() as conn, conn.cursor() as cursor:
+        try:
+            snapshot = build_tour_snapshot(cursor, project_id)
+        except TourRenderReadinessError as exc:
+            raise HTTPException(404 if str(exc) == "project not found" else 409, str(exc)) from exc
+        for shot in snapshot["shots"]:
+            try:
+                shot["variant_checksum"] = file_checksum(storage.path(shot["variant_key"]))
+                if file_checksum(storage.path(shot["voiceover_key"])) != shot["voiceover_checksum"]:
+                    raise HTTPException(409, f"shot {shot['ordinal']} voiceover file has changed")
+            except OSError as exc:
+                raise HTTPException(409, f"shot {shot['ordinal']} media is unavailable") from exc
+        music = None
+        if body.music_asset_id:
+            cursor.execute(
+                "SELECT id,storage_key,checksum,media_duration,rights_metadata FROM assets WHERE id=%s AND project_id=%s AND asset_type='TOUR_MUSIC'",
+                (body.music_asset_id, project_id),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise HTTPException(404, "tour music asset not found")
+            if row[4].get("usage_confirmed") is not True:
+                raise HTTPException(409, "music usage rights are not confirmed")
+            try:
+                if file_checksum(storage.path(row[1])) != row[2]:
+                    raise HTTPException(409, "music file has changed")
+            except OSError as exc:
+                raise HTTPException(409, "music file is unavailable") from exc
+            music = {
+                "asset_id": str(row[0]),
+                "storage_key": row[1],
+                "checksum": row[2],
+                "duration": float(row[3]),
+            }
+        render_spec = {
+            "render_type": "TOUR_GUIDE",
+            **snapshot,
+            "music": music,
+            "opening_title": body.opening_title.strip(),
+            "closing_title": body.closing_title.strip(),
+            "incomplete_demo_preview": music is None,
+            "settings": {
+                "width": 720,
+                "height": 1280,
+                "fps": 25,
+                "video_codec": "h264",
+                "audio_codec": "aac",
+                "music_volume": 0.22,
+                "ducking_threshold": 0.015,
+                "ducking_ratio": 8,
+                "ducking_attack_ms": 20,
+                "ducking_release_ms": 350,
+            },
+        }
+        cursor.execute(
+            "INSERT INTO renders(project_id,status,render_spec) VALUES (%s,'QUEUED',%s) RETURNING id",
+            (project_id, Jsonb(render_spec)),
+        )
+        render_id = cursor.fetchone()[0]
+        record_event(
+            cursor,
+            project_id,
+            "TOUR_RENDER_SUBMITTED",
+            "render",
+            render_id,
+            {
+                "source_plan_id": snapshot["source_plan_id"],
+                "source_plan_version": snapshot["source_plan_version"],
+                "incomplete_demo_preview": music is None,
+            },
+        )
+        conn.commit()
+    enqueue(str(render_id), "render")
+    return {"id": str(render_id), "status": "QUEUED", "incomplete_demo_preview": music is None}
 
 
 @app.get("/projects/{project_id}/renders")

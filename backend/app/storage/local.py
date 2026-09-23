@@ -43,3 +43,6 @@ class LocalStorage:
 
     def exists(self, key: str) -> bool:
         return self._safe(key).exists()
+
+    def delete(self, key: str) -> None:
+        self._safe(key).unlink(missing_ok=True)

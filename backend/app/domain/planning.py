@@ -5,8 +5,8 @@ from pydantic import BaseModel, Field, model_validator
 
 class PlanningRequest(BaseModel):
     project_id: str
-    project_type: Literal["MUSIC_VIDEO"] = "MUSIC_VIDEO"
-    project_title: str = "Untitled music video"
+    project_type: Literal["MUSIC_VIDEO", "TOUR_GUIDE"] = "MUSIC_VIDEO"
+    project_title: str = "Untitled project"
     creative_brief: str = Field(min_length=1)
     target_duration_seconds: float = Field(gt=0, le=600)
     aspect_ratio: str
@@ -44,10 +44,19 @@ class PlanShot(BaseModel):
     environment: str = Field(min_length=1)
     continuity_notes: str = ""
     reference_asset_ids: list[str] = Field(default_factory=list)
+    location_or_motif: str | None = None
+    pov_description: str | None = None
+    narration: str | None = None
+    factual_claims: list["FactualClaim"] = Field(default_factory=list)
+
+
+class FactualClaim(BaseModel):
+    claim: str = Field(min_length=1, max_length=500)
+    sources: list[str] = Field(default_factory=list)
 
 
 class PlanningResult(BaseModel):
-    schema_version: Literal["music-video-plan-v1"]
+    schema_version: Literal["music-video-plan-v1", "tour-guide-plan-v1"]
     concept_title: str = Field(min_length=1)
     logline: str = Field(min_length=1)
     treatment: str = Field(min_length=1)
@@ -62,6 +71,17 @@ class PlanningResult(BaseModel):
         keys = [shot.item_key for shot in self.shots]
         if len(keys) != len(set(keys)):
             raise ValueError("shot item keys must be unique")
+        if self.schema_version == "tour-guide-plan-v1":
+            if not 4 <= len(self.shots) <= 5:
+                raise ValueError("tour guide plan must contain 4 or 5 scenes")
+            for scene in self.shots:
+                if not all(
+                    value and value.strip()
+                    for value in (scene.location_or_motif, scene.pov_description, scene.narration)
+                ):
+                    raise ValueError(
+                        "tour guide scenes require location, POV description, and narration"
+                    )
         return self
 
 
@@ -71,9 +91,30 @@ def validate_plan(
     target_duration: float,
     maximum_shots: int,
     allowed_asset_ids: set[str],
+    require_verified_sources: bool = True,
 ) -> PlanningResult:
     if len(result.shots) > maximum_shots:
         raise ValueError("plan exceeds maximum shot count")
+    if result.schema_version == "tour-guide-plan-v1":
+        if not 30 <= target_duration <= 45:
+            raise ValueError("tour guide target duration must be between 30 and 45 seconds")
+        missing = [
+            claim.claim
+            for scene in result.shots
+            for claim in scene.factual_claims
+            if not claim.sources
+        ]
+        if missing and require_verified_sources:
+            raise ValueError("tour guide plan contains factual claims without sources")
+        invalid_sources = [
+            source
+            for scene in result.shots
+            for claim in scene.factual_claims
+            for source in claim.sources
+            if not source.startswith(("https://", "http://"))
+        ]
+        if invalid_sources:
+            raise ValueError("tour guide fact sources must be HTTP(S) URLs")
     total = sum(shot.duration_seconds for shot in result.shots)
     tolerance = max(1.0, target_duration * 0.1)
     if abs(total - target_duration) > tolerance:

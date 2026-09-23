@@ -86,3 +86,45 @@ def test_migration_on_clean_database_has_exact_schema_and_constraints():
                 (database_name,),
             )
             admin.execute(f'DROP DATABASE IF EXISTS "{database_name}"')
+
+
+def test_migration_004_preserves_existing_music_video_and_asset_rows():
+    database_name = f"hype_migration_upgrade_{uuid4().hex}"
+    with psycopg.connect(ADMIN_URL, autocommit=True) as admin:
+        admin.execute(f'CREATE DATABASE "{database_name}"')
+    url = ADMIN_URL.rsplit("/", 1)[0] + f"/{database_name}"
+    try:
+        with psycopg.connect(url) as conn:
+            for migration in MIGRATIONS[:3]:
+                conn.execute(migration.read_text())
+            project_id = conn.execute(
+                "INSERT INTO projects(project_type,title) VALUES ('MUSIC_VIDEO','existing') RETURNING id"
+            ).fetchone()[0]
+            shot_id = conn.execute(
+                "INSERT INTO shots(project_id,ordinal,prompt,intended_duration) "
+                "VALUES (%s,1,'existing',3) RETURNING id",
+                (project_id,),
+            ).fetchone()[0]
+            for key in ("legacy-a", "legacy-b"):
+                conn.execute(
+                    "INSERT INTO assets(project_id,asset_type,storage_key,mime_type,size_bytes) "
+                    "VALUES (%s,'TOUR_MUSIC',%s,'audio/wav',1)",
+                    (project_id, key),
+                )
+            conn.execute(MIGRATIONS[3].read_text())
+            assert conn.execute(
+                "SELECT source_plan_version,source_scene_duration FROM shots WHERE id=%s",
+                (shot_id,),
+            ).fetchone() == (None, None)
+            assert conn.execute(
+                "SELECT shot_id,source_plan_id,media_duration FROM assets WHERE project_id=%s",
+                (project_id,),
+            ).fetchall() == [(None, None, None), (None, None, None)]
+    finally:
+        with psycopg.connect(ADMIN_URL, autocommit=True) as admin:
+            admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname=%s AND pid <> pg_backend_pid()",
+                (database_name,),
+            )
+            admin.execute(f'DROP DATABASE IF EXISTS "{database_name}"')

@@ -59,6 +59,7 @@ class MockVideoProvider:
         if status.status != NormalizedStatus.SUCCEEDED:
             return GenerationResult(provider_job_id, status.status, error=status.error)
         request = self.jobs[provider_job_id]["request"]
+        resolution = "180x320" if request.aspect_ratio == "9:16" else "320x180"
         self.output_root.mkdir(parents=True, exist_ok=True)
         output = self.output_root / f"{provider_job_id}.mp4"
         command = [
@@ -67,7 +68,7 @@ class MockVideoProvider:
             "-f",
             "lavfi",
             "-i",
-            f"color=c=0x17324d:s=320x180:d={request.target_duration}",
+            f"color=c=0x17324d:s={resolution}:d={request.target_duration}",
             "-vf",
             "drawtext=text='HYPE MOCK':fontcolor=white:fontsize=24:x=20:y=80",
             "-an",
