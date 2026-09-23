@@ -5,7 +5,7 @@ import math
 from datetime import datetime
 from pathlib import PurePath
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,7 +20,7 @@ from backend.app.db import connection
 from backend.app.domain.models import JobStatus
 from backend.app.domain.planning import PlanningRequest, PlanningResult, validate_plan
 from backend.app.queue import enqueue
-from backend.app.render import probe_audio, probe_duration
+from backend.app.render import probe_audio, probe_duration, probe_video
 from backend.app.services.tour_render import (
     TourRenderReadinessError,
     build_tour_snapshot,
@@ -350,7 +350,11 @@ def list_assets(project_id: UUID):
         {
             "id": str(row[0]),
             "asset_type": row[1],
-            "filename": PurePath(row[2]).name,
+            "filename": (
+                row[6].get("original_filename", PurePath(row[2]).name)
+                if row[1] == "TOUR_FOOTAGE"
+                else PurePath(row[2]).name
+            ),
             "mime_type": row[3],
             "size_bytes": row[4],
             "checksum": row[5],
@@ -364,14 +368,20 @@ def list_assets(project_id: UUID):
             "media_duration": float(row[13]) if row[13] is not None else None,
             "provenance_current": (
                 True
-                if row[1] != "VOICEOVER"
+                if row[1] not in {"VOICEOVER", "TOUR_FOOTAGE"}
                 else bool(
                     row[14] == row[9]
                     and row[15] == row[10]
                     and row[16] == row[11]
-                    and row[17]
-                    and row[12] == hashlib.sha256(row[17].encode("utf-8")).hexdigest()
                     and row[18] == "APPROVED"
+                    and (
+                        row[1] == "TOUR_FOOTAGE"
+                        or (
+                            row[17]
+                            and row[12]
+                            == hashlib.sha256(row[17].encode("utf-8")).hexdigest()
+                        )
+                    )
                 )
             ),
         }
@@ -497,6 +507,126 @@ def upload_tour_voiceover(shot_id: UUID, file: UploadFile = File(...)):  # noqa:
         "duration": duration,
         "mime_type": detected_mime,
     }
+
+
+@app.post("/shots/{shot_id}/footage", status_code=202)
+def upload_tour_footage(
+    shot_id: UUID,
+    idempotency_key: str = Form(...),
+    rights_metadata: str = Form(...),
+    file: UploadFile = File(...),  # noqa: B008
+):
+    filename = file.filename or ""
+    if (
+        not filename
+        or PurePath(filename).name != filename
+        or "\\" in filename
+        or len(filename.encode("utf-8")) > 200
+        or any(ord(character) < 32 for character in filename)
+    ):
+        raise HTTPException(400, "unsafe or missing filename")
+    if not idempotency_key.strip() or len(idempotency_key) > 200:
+        raise HTTPException(422, "idempotency key must contain 1 to 200 characters")
+    try:
+        rights = json.loads(rights_metadata)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(422, "rights metadata must be valid JSON") from exc
+    if not isinstance(rights, dict):
+        raise HTTPException(422, "rights metadata must be a JSON object")
+    if not str(rights.get("source", "")).strip() or not str(rights.get("license", "")).strip():
+        raise HTTPException(422, "footage source and licence are required")
+    if rights.get("usage_confirmed") is not True:
+        raise HTTPException(422, "footage usage rights must be confirmed")
+    if rights.get("depicts_real_person") is True and rights.get("likeness_consent_confirmed") is not True:
+        raise HTTPException(422, "likeness consent must be confirmed for depicted people")
+    data = file.file.read(settings.max_asset_upload_bytes + 1)
+    if not data:
+        raise HTTPException(400, "uploaded file is empty")
+    if len(data) > settings.max_asset_upload_bytes:
+        raise HTTPException(413, "uploaded file exceeds the size limit")
+    checksum = hashlib.sha256(data).hexdigest()
+    storage = LocalStorage(settings.storage_root)
+    temporary_key = f"footage-validation/{uuid4()}"
+    storage.save(temporary_key, data)
+    try:
+        media = probe_video(storage.path(temporary_key))
+    except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    finally:
+        storage.delete(temporary_key)
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT s.project_id,p.project_type,s.source_plan_id,s.source_plan_version,"
+            "s.source_plan_item_key,s.source_scene_duration,pp.status,pp.version,pp.materialized_at "
+            "FROM shots s JOIN projects p ON p.id=s.project_id "
+            "LEFT JOIN project_plans pp ON pp.id=s.source_plan_id WHERE s.id=%s FOR UPDATE OF s",
+            (shot_id,),
+        )
+        shot = cursor.fetchone()
+        if shot is None:
+            raise HTTPException(404, "shot not found")
+        if shot[1] != "TOUR_GUIDE":
+            raise HTTPException(422, "footage import is available only for tour guide shots")
+        if not shot[2] or not shot[3] or not shot[4] or shot[6] != "APPROVED" or shot[7] != shot[3] or shot[8] is None:
+            raise HTTPException(409, "tour guide shot provenance is not current")
+        if media["duration"] + 0.01 < float(shot[5]):
+            raise HTTPException(422, "footage is shorter than the approved scene duration")
+        request_data = {
+            "origin": "producer_upload",
+            "original_checksum": checksum,
+            "original_duration": media["duration"],
+            "original_width": media["width"],
+            "original_height": media["height"],
+            "original_codec": media["codec"],
+            "original_container": media["container"],
+            "trim_start_seconds": 0,
+            "target_duration": float(shot[5]),
+            "tour_provenance": {"source_plan_id": str(shot[2]), "source_plan_version": shot[3], "source_plan_item_key": shot[4]},
+        }
+        cursor.execute("SELECT id,status,shot_id,request_data FROM jobs WHERE idempotency_key=%s", (idempotency_key,))
+        existing = cursor.fetchone()
+        if existing:
+            prior = existing[3] or {}
+            if (
+                existing[2] != shot_id
+                or prior.get("original_checksum") != checksum
+                or prior.get("tour_provenance") != request_data["tour_provenance"]
+                or prior.get("target_duration") != request_data["target_duration"]
+            ):
+                raise HTTPException(409, "idempotency key belongs to another footage upload")
+            if existing[1] == "QUEUED":
+                enqueue(str(existing[0]), "footage")
+            return {"job_id": str(existing[0]), "status": existing[1], "deduplicated": True, "asset_id": prior.get("original_asset_id")}
+        original_key = f"projects/{shot[0]}/footage/{shot_id}/{uuid4()}.source"
+        storage.save(original_key, data)
+        try:
+            cursor.execute(
+                "INSERT INTO assets(project_id,asset_type,storage_key,mime_type,size_bytes,checksum,rights_metadata,shot_id,source_plan_id,source_plan_version,source_plan_item_key,media_duration) "
+                "VALUES (%s,'TOUR_FOOTAGE',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                (shot[0], original_key, {"mp4": "video/mp4", "mov": "video/quicktime", "webm": "video/webm", "matroska": "video/x-matroska"}[media["container"]], len(data), checksum, Jsonb({**rights, "original_filename": filename}), shot_id, shot[2], shot[3], shot[4], media["duration"]),
+            )
+            asset_id = cursor.fetchone()[0]
+            request_data["original_asset_id"] = str(asset_id)
+            request_data["original_key"] = original_key
+            cursor.execute(
+                "INSERT INTO jobs(project_id,shot_id,job_type,status,idempotency_key,max_retries,request_data) "
+                "VALUES (%s,%s,'FOOTAGE_IMPORT','QUEUED',%s,0,%s) RETURNING id",
+                (shot[0], shot_id, idempotency_key, Jsonb(request_data)),
+            )
+            job_id = cursor.fetchone()[0]
+            record_event(cursor, shot[0], "TOUR_FOOTAGE_UPLOADED", "asset", asset_id, {"shot_id": str(shot_id), "job_id": str(job_id), "checksum": checksum, "trim_start_seconds": 0})
+            conn.commit()
+        except Exception:
+            storage.delete(original_key)
+            raise
+    try:
+        enqueue(str(job_id), "footage")
+    except Exception as exc:
+        raise HTTPException(
+            503,
+            "footage was stored but queueing failed; repeat the same idempotent request",
+        ) from exc
+    return {"job_id": str(job_id), "status": "QUEUED", "deduplicated": False, "asset_id": str(asset_id)}
 
 
 @app.post("/projects/{project_id}/tour-music", status_code=201)
@@ -958,12 +1088,63 @@ def variants(shot_id: UUID):
 def select_variant(shot_id: UUID, variant_id: UUID):
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(
-            "SELECT project_id FROM shots WHERE id=%s AND EXISTS (SELECT 1 FROM shot_variants WHERE id=%s AND shot_id=%s)",
-            (shot_id, variant_id, shot_id),
+            "SELECT s.project_id,p.project_type,s.source_plan_id,s.source_plan_version,"
+            "s.source_plan_item_key,pp.status,pp.materialized_at,ga.parameters,s.source_scene_duration "
+            "FROM shots s JOIN projects p ON p.id=s.project_id "
+            "JOIN shot_variants v ON v.shot_id=s.id AND v.id=%s "
+            "JOIN generation_attempts ga ON ga.id=v.generation_attempt_id "
+            "LEFT JOIN project_plans pp ON pp.id=s.source_plan_id WHERE s.id=%s FOR UPDATE OF s",
+            (variant_id, shot_id),
         )
         project = cursor.fetchone()
         if not project:
             raise HTTPException(404, "variant not found")
+        if project[1] == "TOUR_GUIDE":
+            expected = {
+                "source_plan_id": str(project[2]),
+                "source_plan_version": project[3],
+                "source_plan_item_key": project[4],
+            }
+            if (
+                project[5] != "APPROVED"
+                or project[6] is None
+                or (project[7] or {}).get("tour_provenance") != expected
+                or (
+                    (project[7] or {}).get("origin") == "producer_upload"
+                    and (
+                        (project[7] or {}).get("target_duration") is None
+                        or abs(
+                            float((project[7] or {})["target_duration"])
+                            - float(project[8])
+                        )
+                        > 0.01
+                    )
+                )
+            ):
+                raise HTTPException(409, "tour guide variant provenance is no longer current")
+            parameters = project[7] or {}
+            if parameters.get("origin") == "producer_upload":
+                cursor.execute(
+                    "SELECT storage_key,checksum,source_plan_id,source_plan_version,"
+                    "source_plan_item_key FROM assets WHERE id=%s AND project_id=%s "
+                    "AND shot_id=%s AND asset_type='TOUR_FOOTAGE'",
+                    (parameters.get("original_asset_id"), project[0], shot_id),
+                )
+                original = cursor.fetchone()
+                if (
+                    not original
+                    or original[1] != parameters.get("original_checksum")
+                    or (str(original[2]), original[3], original[4])
+                    != (
+                        expected["source_plan_id"],
+                        expected["source_plan_version"],
+                        expected["source_plan_item_key"],
+                    )
+                    or not LocalStorage(settings.storage_root).exists(original[0])
+                    or file_checksum(LocalStorage(settings.storage_root).path(original[0]))
+                    != original[1]
+                ):
+                    raise HTTPException(409, "producer footage original is no longer current")
         cursor.execute(
             "UPDATE shot_variants SET review_status='SUPERSEDED' WHERE shot_id=%s AND review_status='SELECTED'",
             (shot_id,),

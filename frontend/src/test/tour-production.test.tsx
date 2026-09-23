@@ -11,13 +11,14 @@ it("shows Tour provenance, generates mock variants, and persists selection", asy
   let selected = false;
   let assets: Asset[] = [];
   const shot: Shot = { id: "shot-1", ordinal: 1, title: "Kalemegdan", prompt: "POV walk", intended_duration: 8, status: "PLANNED", selected_variant_id: null, source_plan_id: "plan-2", source_plan_item_key: "scene-001", source_plan_version: 2, source_scene_duration: 8, source_location_or_motif: "Kalemegdan", source_pov_description: "Prilazak vidikovcu iz prvog lica", source_narration: "Stižemo do pogleda na ušće.", source_factual_claims: [{ claim: "Pogled na ušće", sources: ["https://example.test/source"] }] };
-  const variant: Variant = { id: "variant-1", mime_type: "video/mp4", duration: 8, review_status: "UNREVIEWED", created_at: "x", generation_attempt_id: "attempt-1", attempt_number: 1, job_id: "job-1", provider: "mock", model: "mock-video-v1", generation_mode: "text-to-video", plan_provenance: { source_plan_id: "plan-2", source_plan_version: 2, source_plan_item_key: "scene-001" } };
+  const variant: Variant = { id: "variant-1", mime_type: "video/mp4", duration: 8, review_status: "UNREVIEWED", created_at: "x", generation_attempt_id: "attempt-1", attempt_number: 1, job_id: "job-1", provider: "producer_upload", model: "local-ffmpeg", generation_mode: "producer-upload", provenance: { origin: "producer_upload", generation_mode: "producer-upload", normalization: { trim_start_seconds: 0, width: 720, height: 1280, fps: 25, padding_applied: true }, tour_provenance: { source_plan_id: "plan-2", source_plan_version: 2, source_plan_item_key: "scene-001" } }, plan_provenance: { source_plan_id: "plan-2", source_plan_version: 2, source_plan_item_key: "scene-001" } };
   vi.spyOn(api, "project").mockResolvedValue(project);
   vi.spyOn(api, "assets").mockImplementation(async () => assets);
   vi.spyOn(api, "uploadVoiceover").mockImplementation(async () => { assets = [{ id: "voice-1", asset_type: "VOICEOVER", filename: "voice.wav", mime_type: "audio/wav", size_bytes: 100, checksum: "checksum", rights_metadata: {}, created_at: "x", shot_id: shot.id, source_plan_id: "plan-2", source_plan_version: 2, source_plan_item_key: "scene-001", narration_checksum: "narration", media_duration: 6.5 }]; return { id: "voice-1", shot_id: shot.id, duration: 6.5, mime_type: "audio/wav" }; });
+  vi.spyOn(api, "uploadTourFootage").mockResolvedValue({ job_id: "footage-job", status: "QUEUED", deduplicated: false, asset_id: "footage-1" });
   vi.spyOn(api, "shots").mockImplementation(async () => [{ ...shot, selected_variant_id: selected ? variant.id : null, latest_job_status: selected ? "SUCCEEDED" : null }]);
   vi.spyOn(api, "generate").mockResolvedValue({ job_id: "job-1", status: "QUEUED" });
-  vi.spyOn(api, "job").mockResolvedValue({ id: "job-1", status: "SUCCEEDED", retry_count: 0, error_data: null, created_at: "x", started_at: "x", completed_at: "x" });
+  vi.spyOn(api, "job").mockImplementation(async id => ({ id, status: id === "footage-job" ? "PROCESSING" : "SUCCEEDED", retry_count: 0, error_data: null, created_at: "x", started_at: "x", completed_at: id === "footage-job" ? null : "x" }));
   vi.spyOn(api, "variants").mockImplementation(async () => [{ ...variant, review_status: selected ? "SELECTED" : "UNREVIEWED" }]);
   vi.spyOn(api, "selectVariant").mockImplementation(async () => { selected = true; return {}; });
   vi.spyOn(api, "rejectVariant").mockResolvedValue({});
@@ -31,6 +32,13 @@ it("shows Tour provenance, generates mock variants, and persists selection", asy
   expect(screen.getByText("Mock visual · no paid provider")).toBeVisible();
   expect(screen.queryByText("Add planned shot")).not.toBeInTheDocument();
   expect(screen.queryByLabelText("Reference image for shot 1")).not.toBeInTheDocument();
+  expect(screen.getByText(/Longer clips are trimmed from 00:00/)).toBeVisible();
+  await userEvent.upload(screen.getByLabelText("Footage for shot 1"), new File(["video"], "belgrade.mp4", { type: "video/mp4" }));
+  await userEvent.type(screen.getByLabelText("Source / owner"), "Producer original");
+  await userEvent.type(screen.getByLabelText("Licence"), "Owned");
+  await userEvent.click(screen.getByText("I confirm ownership or licensed usage rights"));
+  await userEvent.click(screen.getByRole("button", { name: "Import footage" }));
+  await waitFor(() => expect(api.uploadTourFootage).toHaveBeenCalledWith("shot-1", expect.any(File), expect.objectContaining({ source: "Producer original", license: "Owned", usage_confirmed: true }), expect.any(String)));
   await userEvent.upload(screen.getByLabelText("Voiceover for shot 1"), new File(["voice"], "voice.wav", { type: "audio/wav" }));
   await userEvent.click(screen.getByRole("button", { name: "Upload voiceover" }));
   await waitFor(() => expect(screen.getByText("6.50s audio / 8.00s shot")).toBeVisible());
@@ -40,6 +48,8 @@ it("shows Tour provenance, generates mock variants, and persists selection", asy
   expect(api.generate).toHaveBeenCalledTimes(2);
 
   await userEvent.click(screen.getByRole("link", { name: /Review$/ }));
+  expect(await screen.findByText("Source aspect ratio was preserved with padding for the vertical frame.")).toBeVisible();
+  expect(screen.getByText("producer_upload")).toBeVisible();
   await userEvent.click(await screen.findByRole("button", { name: "Select" }));
   await waitFor(() => expect(screen.getByText("Current selection")).toBeVisible());
   expect((await api.shots(project.id))[0].selected_variant_id).toBe(variant.id);

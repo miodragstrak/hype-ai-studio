@@ -49,6 +49,13 @@ asynchronous generation monitoring, variant selection/rejection, render readines
 preview/download. Its routes are `/projects`, `/projects/new`, and the Setup, Assets, Shots, Review,
 and Render stages under `/projects/:projectId`.
 
+For Tour Guide projects, approved materialized shots also accept producer-supplied footage on the
+Shots page. Uploads require source, licence, usage-rights confirmation, and likeness consent when a
+real person is depicted. The original and its checksum are preserved; the worker creates a local
+720x1280, 25 fps, H.264 review copy. Footage must cover the approved scene duration. Longer clips
+are trimmed from `00:00`; shorter clips are rejected and never looped. Review labels these variants
+as `producer_upload / local-ffmpeg / producer-upload` before the usual reject/select/render flow.
+
 Set `VITE_API_BASE_URL` when the API is not running on `http://localhost:8000`. For local work:
 
 ```bash

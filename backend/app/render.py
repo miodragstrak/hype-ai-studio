@@ -66,6 +66,85 @@ def probe_audio(path: Path) -> tuple[float, str]:
     return duration, format_name
 
 
+def probe_video(path: Path) -> dict[str, Any]:
+    probe = subprocess.run(
+        [
+            settings.ffprobe_executable,
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode:
+        raise RuntimeError("uploaded file could not be read as video")
+    metadata = json.loads(probe.stdout)
+    videos = [stream for stream in metadata.get("streams", []) if stream.get("codec_type") == "video"]
+    if len(videos) != 1:
+        raise RuntimeError("uploaded footage must contain exactly one video stream")
+    video = videos[0]
+    codec = str(video.get("codec_name", ""))
+    if codec not in {"h264", "hevc", "vp8", "vp9"}:
+        raise RuntimeError("footage video codec must be H.264, HEVC, VP8, or VP9")
+    format_names = set(str(metadata.get("format", {}).get("format_name", "")).split(","))
+    supported_containers = ("mp4", "mov", "webm", "matroska")
+    container = next((name for name in supported_containers if name in format_names), None)
+    if container is None:
+        raise RuntimeError("footage container must be MP4, MOV, WebM, or Matroska")
+    duration = float(metadata.get("format", {}).get("duration", 0))
+    width, height = int(video.get("width", 0)), int(video.get("height", 0))
+    if not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError("footage duration is invalid")
+    if width <= 0 or height <= 0:
+        raise RuntimeError("footage dimensions are invalid")
+    return {"duration": duration, "width": width, "height": height, "codec": codec, "container": container}
+
+
+def normalize_tour_footage(input_path: Path, output_path: Path, duration: float) -> float:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        settings.ffmpeg_executable,
+        "-y",
+        "-ss",
+        "0",
+        "-i",
+        str(input_path),
+        "-t",
+        str(duration),
+        "-an",
+        "-vf",
+        (
+            "scale=720:1280:force_original_aspect_ratio=decrease,"
+            "pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=#111517,setsar=1,fps=25"
+        ),
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode:
+        output_path.unlink(missing_ok=True)
+        raise RuntimeError(completed.stderr[-1000:])
+    metadata = probe_video(output_path)
+    if metadata["codec"] != "h264" or (metadata["width"], metadata["height"]) != (720, 1280):
+        output_path.unlink(missing_ok=True)
+        raise RuntimeError("normalized footage does not match the Tour media profile")
+    if abs(metadata["duration"] - duration) > 0.15:
+        output_path.unlink(missing_ok=True)
+        raise RuntimeError("normalized footage duration does not match the approved scene")
+    return metadata["duration"]
+
+
 def compose_video(
     input_paths: list[Path],
     audio_path: Path,

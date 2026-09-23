@@ -24,13 +24,159 @@ from backend.app.providers.runway import (
     ReferenceUploadError,
 )
 from backend.app.queue import dequeue, enqueue
-from backend.app.render import compose_tour_video, compose_video
+from backend.app.render import (
+    compose_tour_video,
+    compose_video,
+    normalize_tour_footage,
+    probe_video,
+)
 from backend.app.security import sanitize, sanitize_text
 from backend.app.services.jobs import transition
 from backend.app.services.planning_budget import reconcile_budget, reserve_budget
 from backend.app.services.runway_budget import BudgetExceededError, reserve_attempt
 from backend.app.services.tour_render import build_tour_snapshot, file_checksum
 from backend.app.storage.local import LocalStorage
+
+
+def process_footage_import(job_id: str) -> None:
+    storage = LocalStorage(settings.storage_root)
+    attempt_id = None
+    output_key = None
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "UPDATE jobs SET status='SUBMITTING',started_at=COALESCE(started_at,now()),"
+            "updated_at=now() WHERE id=%s AND status='QUEUED' "
+            "RETURNING id,project_id,shot_id,status,request_data",
+            (job_id,),
+        )
+        job = cursor.fetchone()
+        if job:
+            cursor.execute(
+                "INSERT INTO events(project_id,event_type,actor_type,entity_type,entity_id,payload) "
+                "VALUES (%s,'JOB_STATE_CHANGED','worker','job',%s,%s)",
+                (job[1], job[0], Jsonb({"from": "QUEUED", "to": "SUBMITTING"})),
+            )
+            conn.commit()
+    if not job:
+        return
+    request = job[4] or {}
+    try:
+        with connection() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT p.project_type,s.source_plan_id,s.source_plan_version,"
+                "s.source_plan_item_key,s.source_scene_duration,pp.status,pp.materialized_at "
+                "FROM shots s JOIN projects p ON p.id=s.project_id "
+                "LEFT JOIN project_plans pp ON pp.id=s.source_plan_id WHERE s.id=%s",
+                (job[2],),
+            )
+            shot = cursor.fetchone()
+            expected = request.get("tour_provenance")
+            if (
+                not shot
+                or expected
+                != {
+                    "source_plan_id": str(shot[1]),
+                    "source_plan_version": shot[2],
+                    "source_plan_item_key": shot[3],
+                }
+                or shot[0] != "TOUR_GUIDE"
+                or shot[5] != "APPROVED"
+                or shot[6] is None
+            ):
+                raise ValueError("tour guide footage provenance is no longer current")
+            cursor.execute(
+                "SELECT storage_key,checksum,rights_metadata,source_plan_id,"
+                "source_plan_version,source_plan_item_key FROM assets "
+                "WHERE id=%s AND project_id=%s AND shot_id=%s AND asset_type='TOUR_FOOTAGE'",
+                (request.get("original_asset_id"), job[1], job[2]),
+            )
+            asset = cursor.fetchone()
+            if not asset or asset[1] != request.get("original_checksum"):
+                raise ValueError("producer footage asset is no longer valid")
+            rights = asset[2] or {}
+            if rights.get("usage_confirmed") is not True or not rights.get("source") or not rights.get("license"):
+                raise ValueError("producer footage rights are no longer valid")
+            if rights.get("depicts_real_person") is True and rights.get("likeness_consent_confirmed") is not True:
+                raise ValueError("producer footage likeness consent is no longer valid")
+            if (str(asset[3]), asset[4], asset[5]) != (
+                expected["source_plan_id"],
+                expected["source_plan_version"],
+                expected["source_plan_item_key"],
+            ):
+                raise ValueError("producer footage asset provenance is stale")
+            original_path = storage.path(asset[0])
+            if file_checksum(original_path) != asset[1]:
+                raise ValueError("producer footage file checksum changed")
+            media = probe_video(original_path)
+            target_duration = float(shot[4])
+            if abs(float(request.get("target_duration", -1)) - target_duration) > 0.01:
+                raise ValueError("tour guide shot duration changed after footage upload")
+            if media["duration"] + 0.01 < target_duration:
+                raise ValueError("producer footage is shorter than the approved scene duration")
+            transition(job[0], JobStatus.PROCESSING)
+            cursor.execute(
+                "SELECT COALESCE(MAX(attempt_number),0)+1 FROM generation_attempts WHERE shot_id=%s",
+                (job[2],),
+            )
+            attempt_number = cursor.fetchone()[0]
+            parameters = {
+                **request,
+                "generation_mode": "producer-upload",
+                "aspect_ratio": "9:16",
+                "normalization": {
+                    "trim_start_seconds": 0,
+                    "width": 720,
+                    "height": 1280,
+                    "fps": 25,
+                    "padding_applied": media["width"] * 16 != media["height"] * 9,
+                },
+            }
+            cursor.execute(
+                "INSERT INTO generation_attempts(project_id,shot_id,job_id,provider,model,"
+                "submitted_prompt,parameters,attempt_number,status,started_at) "
+                "VALUES (%s,%s,%s,'producer_upload','local-ffmpeg','Producer-supplied footage',"
+                "%s,%s,'PROCESSING',now()) RETURNING id",
+                (job[1], job[2], job[0], Jsonb(parameters), attempt_number),
+            )
+            attempt_id = cursor.fetchone()[0]
+            conn.commit()
+        output_key = f"projects/{job[1]}/variants/{job[0]}.mp4"
+        duration = normalize_tour_footage(original_path, storage.path(output_key), target_duration)
+        checksum = file_checksum(storage.path(output_key))
+        size = storage.path(output_key).stat().st_size
+        with connection() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO shot_variants(shot_id,generation_attempt_id,storage_key,"
+                "mime_type,duration,review_status) VALUES (%s,%s,%s,'video/mp4',%s,'UNREVIEWED') RETURNING id",
+                (job[2], attempt_id, output_key, duration),
+            )
+            variant_id = cursor.fetchone()[0]
+            cursor.execute(
+                "UPDATE generation_attempts SET status='SUCCEEDED',completed_at=now(),duration=%s,"
+                "provider_metadata=%s WHERE id=%s",
+                (duration, Jsonb({"origin": "producer_upload", "checksum": checksum, "size_bytes": size}), attempt_id),
+            )
+            cursor.execute(
+                "UPDATE jobs SET status='SUCCEEDED',completed_at=now(),error_data=NULL,updated_at=now() WHERE id=%s",
+                (job[0],),
+            )
+            cursor.execute(
+                "INSERT INTO events(project_id,event_type,actor_type,entity_type,entity_id,payload) "
+                "VALUES (%s,'TOUR_FOOTAGE_NORMALIZED','worker','shot_variant',%s,%s)",
+                (job[1], variant_id, Jsonb({"shot_id": str(job[2]), "origin": "producer_upload", "original_asset_id": request["original_asset_id"], "original_checksum": request["original_checksum"]})),
+            )
+            conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        if output_key:
+            storage.delete(output_key)
+        if attempt_id:
+            with connection() as conn, conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE generation_attempts SET status='FAILED',completed_at=now(),error_data=%s WHERE id=%s",
+                    (Jsonb({"message": sanitize_text(exc), "retryable": False}), attempt_id),
+                )
+                conn.commit()
+        transition(job[0], JobStatus.FAILED, {"message": sanitize_text(exc), "retryable": False})
 
 
 def process_generation(job_id: str) -> None:
@@ -506,6 +652,19 @@ def _process_tour_render(render_id: str, project_id, spec: dict, storage: LocalS
                     raise ValueError("tour music provenance is no longer valid")
                 if music_row[0] != music["storage_key"] or music_row[1] != music["checksum"]:
                     raise ValueError("tour music input changed after submission")
+            for shot in spec["shots"]:
+                if shot.get("variant_origin") != "producer_upload":
+                    continue
+                cursor.execute(
+                    "SELECT storage_key,checksum FROM assets WHERE id=%s AND project_id=%s "
+                    "AND shot_id=%s AND asset_type='TOUR_FOOTAGE'",
+                    (shot.get("original_asset_id"), project_id, shot["shot_id"]),
+                )
+                original = cursor.fetchone()
+                if not original or original[1] != shot.get("original_checksum"):
+                    raise ValueError(f"shot {shot['ordinal']} producer footage provenance changed")
+                if file_checksum(storage.path(original[0])) != original[1]:
+                    raise ValueError(f"shot {shot['ordinal']} original footage file changed")
         if any(
             current[field] != spec.get(field)
             for field in ("source_plan_id", "source_plan_version", "expected_duration")
@@ -523,6 +682,9 @@ def _process_tour_render(render_id: str, project_id, spec: dict, storage: LocalS
             "voiceover_checksum",
             "narration_checksum",
             "voiceover_duration",
+            "variant_origin",
+            "original_asset_id",
+            "original_checksum",
         )
         expected_shots = [
             {field: shot[field] for field in snapshot_shot_fields} for shot in spec["shots"]
@@ -770,6 +932,8 @@ def run() -> None:
             process_render(item["job_id"])
         elif item["kind"] == "planning":
             process_planning(item["job_id"])
+        elif item["kind"] == "footage":
+            process_footage_import(item["job_id"])
 
 
 if __name__ == "__main__":

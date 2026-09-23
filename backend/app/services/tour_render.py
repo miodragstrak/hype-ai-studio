@@ -35,7 +35,7 @@ def build_tour_snapshot(cursor, project_id: Any) -> dict[str, Any]:
         "SELECT s.id,s.ordinal,s.source_plan_id,s.source_plan_version,s.source_plan_item_key,"
         "s.source_scene_duration,s.selected_variant_id,v.storage_key,a.id,a.storage_key,"
         "a.checksum,a.narration_checksum,a.media_duration,s.source_narration,a.source_plan_id,"
-        "a.source_plan_version,a.source_plan_item_key,ga.parameters FROM shots s "
+        "a.source_plan_version,a.source_plan_item_key,ga.parameters,v.duration FROM shots s "
         "LEFT JOIN shot_variants v ON v.id=s.selected_variant_id AND v.shot_id=s.id "
         "LEFT JOIN generation_attempts ga ON ga.id=v.generation_attempt_id "
         "LEFT JOIN assets a ON a.shot_id=s.id AND a.asset_type='VOICEOVER' "
@@ -69,6 +69,12 @@ def build_tour_snapshot(cursor, project_id: Any) -> dict[str, Any]:
             "source_plan_item_key": row[4],
         }:
             raise TourRenderReadinessError(f"shot {row[1]} variant provenance is stale")
+        variant_parameters = row[17] or {}
+        if variant_parameters.get("origin") == "producer_upload" and (
+            abs(float(variant_parameters.get("target_duration", -1)) - float(row[5])) > 0.01
+            or abs(float(row[18]) - float(row[5])) > 0.15
+        ):
+            raise TourRenderReadinessError(f"shot {row[1]} producer footage is stale")
         if float(row[12]) > float(row[5]) + 0.01:
             raise TourRenderReadinessError(f"shot {row[1]} voiceover exceeds scene duration")
         shots.append(
@@ -84,6 +90,9 @@ def build_tour_snapshot(cursor, project_id: Any) -> dict[str, Any]:
                 "voiceover_checksum": row[10],
                 "narration_checksum": row[11],
                 "voiceover_duration": float(row[12]),
+                "variant_origin": (row[17] or {}).get("origin", "provider_generation"),
+                "original_asset_id": (row[17] or {}).get("original_asset_id"),
+                "original_checksum": (row[17] or {}).get("original_checksum"),
             }
         )
     return {
